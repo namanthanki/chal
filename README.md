@@ -98,11 +98,3 @@ Leaf-node count for move-generation validation.
 | S11 | Search (negamax, QS, NMP, LMR, aspiration) |
 | S12 | Perft |
 | S13 | UCI loop |
-
-## Changelog
-
-### v1.1
-- **fix:** expand UCI input buffer from 1 024 B to 64 KiB — prevents illegal moves when the `position … moves` command line exceeds 1 024 characters (games longer than ~200 half-moves).
-
-### v1.0
-- Initial release.

@@ -11,3 +11,6 @@ chal
 *.swp
 *~
 .DS_Store
+
+# Dev test suite
+dev_test*

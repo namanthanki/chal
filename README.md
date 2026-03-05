@@ -1,4 +1,4 @@
-# Chal (v1.1)
+# Chal (v1.2)
 
 **Chal** (Gujarati for "move") is a minimal, didactic chess engine written entirely in a single file of strictly-compliant classical C (ANSI C89 / C90).
 
@@ -6,7 +6,7 @@ The core goal of this project is to serve as an educational resource to teach th
 
 ## Architecture
 
-A single file (`src/chal.c`, **913 lines of code / 521 lines of comments**) split into 13 clearly labelled sections. Each section is a self-contained lesson:
+A single file (`src/chal.c`, **776 lines of code / 528 lines of comments**) split into 13 clearly labelled sections. Each section is a self-contained lesson:
 
 ### Board Representation
 - **0x88 Geometry** — 128-square 1D array; off-board detection is one bitwise `AND` (`sq & 0x88`).

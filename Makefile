@@ -1,6 +1,6 @@
-VERSION = 1.1
+VERSION = 1.3.0
 CC      = gcc
-CFLAGS  = -O2 -Wall -Wextra -pedantic -std=gnu90 -DVERSION=\"$(VERSION)\"
+CFLAGS  = -O2 -Wall -Wextra -pedantic -std=gnu99 -DVERSION=\"$(VERSION)\"
 
 # Cross-platform command definitions
 ifeq ($(OS),Windows_NT)

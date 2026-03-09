@@ -10,7 +10,7 @@
    This file is meant to be read as a book, not just run.
    Every subsystem is a short lesson in engine design.
 
-   Compile:  gcc chal.c -O2 -Wall -Wextra -pedantic -std=gnu99 -o chal
+   Compile:  gcc chal.c -O2 -Wall -Wextra -pedantic -std=c99 -o chal
    Protocol: Universal Chess Interface (UCI)
 ================================================================
 
@@ -36,6 +36,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 /* ===============================================================
    S1  CONSTANTS & TYPES
@@ -46,19 +48,18 @@
    One byte per piece.  Bit 3 = colour (0=White, 1=Black).
    Bits 2..0 = type (1=Pawn .. 6=King, 0=Empty).
 
-       PIECE(c,t)  ->  (c<<3)|t
-       TYPE(p)     ->  p & 7
-       COLOR(p)    ->  p >> 3
+       make_piece(c,t)  ->  (c<<3)|t
+       piece_type(p)    ->  p & 7
+       piece_color(p)   ->  p >> 3
 */
 
 enum { EMPTY=0, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING };
 enum { WHITE=0, BLACK=1 };
-#define SQ_NONE     (-1)
-#define TYPE(p)     ((p) & 7)
-#define COLOR(p)    ((p) >> 3)
-#define PIECE(c,t)  (((c)<<3)|(t))
-#define INF         50000
-#define MATE        30000
+enum { SQ_NONE = -1 };
+static inline int piece_type(int p)  { return p & 7; }
+static inline int piece_color(int p) { return p >> 3; }
+static inline int make_piece(int c, int t) { return (c << 3) | t; }
+enum { INF = 50000, MATE = 30000 };
 
 /* ---------------------------------------------------------------
    MOVE ENCODING
@@ -75,13 +76,18 @@ enum { WHITE=0, BLACK=1 };
    Bits  0.. 6  ->  from-square  (0-127)
    Bits  7..13  ->  to-square    (0-127)
    Bits 14..17  ->  promotion piece type (0 = none)
+
+       move_from(m)          ->  m & 0x7F
+       move_to(m)            ->  (m >> 7) & 0x7F
+       move_promo(m)         ->  (m >> 14) & 0xF
+       make_move_enc(f,t,p)  ->  f|(t<<7)|(p<<14)
 */
 
 typedef int Move;
-#define FROM(m)          ((m) & 0x7F)
-#define TO(m)            (((m)>>7) & 0x7F)
-#define PROMO(m)         (((m)>>14) & 0xF)
-#define MAKE_MOVE(f,t,p) ((f)|((t)<<7)|((p)<<14))
+static inline int  move_from(Move m)  { return m & 0x7F; }
+static inline int  move_to(Move m)    { return (m >> 7) & 0x7F; }
+static inline int  move_promo(Move m) { return (m >> 14) & 0xF; }
+static inline Move make_move_enc(int f, int t, int p) { return f | (t << 7) | (p << 14); }
 
 /* ---------------------------------------------------------------
    TRANSPOSITION TABLE (TT)
@@ -102,28 +108,22 @@ typedef int Move;
            flag  = depth_flag & 3
 */
 
-#define TT_EXACT 0
-#define TT_ALPHA 1
-#define TT_BETA  2
+enum { TT_EXACT=0, TT_ALPHA=1, TT_BETA=2 };
 
 /* 64-bit Zobrist key type -- halves collision rate vs 32-bit */
-#define HASH unsigned long long
+typedef uint64_t HASH;
 
 typedef struct {
     HASH key; int score; Move best_move; unsigned int depth_flag;
 } TTEntry;
 
-/* TT_SIZE must be a power of two (hash_key % TT_SIZE = fast bitwise AND).
-   65536 entries (1 MB) caused ~500x overwrites per depth-9 search, meaning
-   almost every probe past depth 6 was a miss. 1048576 entries (16 MB)
-   brings that to ~31x -- the TT actually contributes at the depths that
-   matter for a 40/5 time control.                                         */
-#define TT_SIZE 1048576
-TTEntry tt[TT_SIZE];
+/* TT size is configurable via UCI setoption name Hash (default 16 MB). */
+TTEntry *tt = NULL;
+int64_t tt_size = 1 << 20; /* default 1M entries = 16 MB */
 
-#define TT_DEPTH(e)  ((e)->depth_flag >> 2)
-#define TT_FLAG(e)   ((e)->depth_flag & 3)
-#define TT_PACK(d,f) (unsigned int)(((d)<<2)|(f))
+static inline unsigned int tt_depth(const TTEntry *e) { return e->depth_flag >> 2; }          /* bits 7..2 */
+static inline unsigned int tt_flag(const TTEntry *e)  { return e->depth_flag & 3; }            /* bits 1..0 */
+static inline unsigned int tt_pack(int d, int f)      { return (unsigned int)((d << 2) | f); } /* write both */
 
 /* ---------------------------------------------------------------
    UNDO HISTORY & KILLERS
@@ -141,12 +141,12 @@ TTEntry tt[TT_SIZE];
 */
 
 typedef struct {
-    Move move; int piece_captured; int ep_square_prev; int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev; int npc_prev[2];
+    Move move; int piece_captured; int ep_square_prev; unsigned int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev; int npc_prev[2];
 } State;
 
 State history[1024];
 
-#define MAX_PLY 64
+enum { MAX_PLY = 64 };
 Move killers[MAX_PLY][2];
 
 /* ---------------------------------------------------------------
@@ -205,13 +205,13 @@ int time_over_flag = 0;
        (sq & 0x88) != 0  ->  off the board
 */
 
-#define SQ_IS_OFF(sq) ((sq) & 0x88)
-#define FOR_EACH_SQ(sq) for(sq=0; sq<128; sq++) if(SQ_IS_OFF(sq)) sq+=7; else
+static inline int sq_is_off(int sq) { return sq & 0x88; }
+#define FOR_EACH_SQ(sq) for(sq=0; sq<128; sq++) if(sq_is_off(sq)) sq+=7; else
 
 int board[128];
 int side, xside;
 int ep_square;
-int castle_rights;    /* bits: 1=WO-O  2=WO-O-O  4=BO-O  8=BO-O-O */
+unsigned int castle_rights;    /* bits: 1=WO-O  2=WO-O-O  4=BO-O  8=BO-O-O */
 int king_sq[2];
 int non_pawn_count[2];
 int ply;
@@ -219,14 +219,14 @@ int halfmove_clock;   /* plies since last pawn move or capture; draw at 100 */
 HASH hash_key;
 
 /* Search telemetry -- reported in UCI info lines */
-long nodes_searched;
+int64_t nodes_searched;
 
 /* Time control -- set by the go command handler before calling search_root.
    time_budget_ms = milliseconds we are allowed to spend on this move.
    0 means no time limit: search_root respects only max_depth.
    search_root checks the clock after each completed depth iteration and
    stops early if the elapsed time exceeds the budget. */
-long time_budget_ms;
+int64_t time_budget_ms;
 
 /* root_ply: value of ply when search_root() was called.
    Used by the repetition detector to distinguish in-tree positions
@@ -267,8 +267,9 @@ int piece_limits[]  = {0,0,12,16,20,20,28};
 static const int castle_kf[] = {4, 4, 116, 116}, castle_kt[] = {6, 2, 118, 114};
 static const int castle_rf[] = {7, 0, 119, 112}, castle_rt[] = {5, 3, 117, 115};
 static const int castle_col[]= {WHITE, WHITE, BLACK, BLACK};
-static const int castle_kmask[]= {~3, ~3, ~12, ~12}; /* Rights stripped when king moves */
-static const int cr_sq[] = {0, 7, 112, 119}, cr_mask[] = {~2, ~1, ~8, ~4}; /* Corner squares */
+static const unsigned int castle_kmask[]= {~3u, ~3u, ~12u, ~12u}; /* Rights stripped when king moves */
+static const int cr_sq[] = {0, 7, 112, 119};
+static const unsigned int cr_mask[] = {~2u, ~1u, ~8u, ~4u}; /* Corner squares */
 
 /* ===============================================================
    S4  ZOBRIST HASHING
@@ -294,15 +295,15 @@ static const int cr_sq[] = {0, 7, 112, 119}, cr_mask[] = {~2, ~1, ~8, ~4}; /* Co
 HASH         zobrist_piece[2][7][128];
 HASH         zobrist_side;
 HASH         zobrist_ep[128];
-unsigned int zobrist_castle[16];
+HASH         zobrist_castle[16];
 
-/* Sungorus rand64: fast LCG, self-seeding, no stdlib dependency.
-   Produces full 64-bit values -- much lower TT collision rate than
-   two 16-bit rand() calls spliced together.                        */
+/* xorshift64* PRNG */
 static HASH rand64(void) {
-    static HASH next = 1;
-    next = next * 6364136223846793005ULL + 1442695040888963407ULL;
-    return next;
+    static HASH s = 1070372631ULL;
+    s ^= s >> 12;
+    s ^= s << 25;
+    s ^= s >> 27;
+    return s * 0x2545F4914F6CDD1DULL;
 }
 
 void init_zobrist(void) {
@@ -310,14 +311,14 @@ void init_zobrist(void) {
         zobrist_piece[c][p][s] = rand64();
     zobrist_side = rand64();
     for (int s=0;s<128;s++) zobrist_ep[s]     = rand64();
-    for (int s=0;s<16; s++) zobrist_castle[s] = (unsigned int)rand64();
+    for (int s=0;s<16; s++) zobrist_castle[s] = rand64();
 }
 
 HASH generate_hash(void) {
     HASH h = 0;
     int sq;
     FOR_EACH_SQ(sq) {
-        if (board[sq]) h ^= zobrist_piece[COLOR(board[sq])][TYPE(board[sq])][sq];
+        if (board[sq]) h ^= zobrist_piece[piece_color(board[sq])][piece_type(board[sq])][sq];
     }
     if (side==BLACK)          h ^= zobrist_side;
     if (ep_square!=SQ_NONE)   h ^= zobrist_ep[ep_square];
@@ -345,16 +346,16 @@ static inline int is_square_attacked(int sq, int ac) {
     /* Pawn check: two diagonal squares natively */
     for (int i=-1; i<=1; i+=2) {
         int tgt = sq + ((ac==WHITE) ? -16 : 16) + i;
-        if (!SQ_IS_OFF(tgt) && board[tgt] && COLOR(board[tgt])==ac && TYPE(board[tgt])==PAWN) return 1;
+        if (!sq_is_off(tgt) && board[tgt] && piece_color(board[tgt])==ac && piece_type(board[tgt])==PAWN) return 1;
     }
     /* Unified Ray-Tracing for Knights, Bishops, Rooks, Kings, and Queens */
     for (int i = piece_offsets[KNIGHT]; i < piece_limits[KING]; i++) {
         int step = step_dir[i], tgt = sq + step;
-        while (!SQ_IS_OFF(tgt)) {
+        while (!sq_is_off(tgt)) {
             int p = board[tgt];
             if (p) {
-                if (COLOR(p) == ac) {
-                    int pt = TYPE(p);
+                if (piece_color(p) == ac) {
+                    int pt = piece_type(p);
                     /* The direction index i tells us which piece types
                        can attack along this particular ray or jump. */
                     if (i < piece_limits[KNIGHT] && pt == KNIGHT) return 1;
@@ -393,16 +394,14 @@ static inline int is_square_attacked(int sq, int ac) {
    the `history` stack to repair the destructive state perfectly.
 */
 
-/* Convenience attack macros.
-   IN_CHECK(s)  -- is side s's king currently in check?
-   ILLEGAL      -- after make_move (side/xside swapped), did the mover
+/* Convenience attack functions.
+   in_check(s)  -- is side s's king currently in check?
+   is_illegal() -- after make_move (side/xside swapped), did the mover
                    leave their own king in check? */
-#define IN_CHECK(s)  is_square_attacked(king_sq[(s)],    (s)^1)
-#define ILLEGAL      is_square_attacked(king_sq[xside],  side)
+static inline int in_check(int s)   { return is_square_attacked(king_sq[s],    s ^ 1); }
+static inline int is_illegal(void)  { return is_square_attacked(king_sq[xside], side); }
 
-static void add_move(Move *list, int *n, int f, int t, int pr) {
-    list[(*n)++] = MAKE_MOVE(f,t,pr);
-}
+static inline void add_move(Move *list, int *n, int f, int t, int pr) { list[(*n)++] = make_move_enc(f,t,pr); }
 
 static void add_promo(Move *list, int *n, int f, int t) {
     add_move(list, n, f, t, QUEEN);
@@ -411,10 +410,15 @@ static void add_promo(Move *list, int *n, int f, int t) {
     add_move(list, n, f, t, KNIGHT);
 }
 
-#define TOGGLE(c,p,s) hash_key ^= zobrist_piece[c][p][s]
+/* XOR piece (color c, type p) at sq in or out of the running Zobrist hash.
+   Because XOR is self-inverse, toggling the same value twice cancels out,
+   which is exactly what make_move uses when it moves a piece from f to t:
+       toggle(side, pt, f)  -- remove from source
+       toggle(side, pt, t)  -- place at destination                        */
+static inline void toggle(int c, int p, int sq) { hash_key ^= zobrist_piece[c][p][sq]; }
 
 void make_move(Move m) {
-    int f=FROM(m), t=TO(m), pr=PROMO(m), p=board[f], pt=TYPE(p), cap=board[t];
+    int f=move_from(m), t=move_to(m), pr=move_promo(m), p=board[f], pt=piece_type(p), cap=board[t];
     history[ply].move = m; history[ply].piece_captured = cap; history[ply].ep_square_prev = ep_square;
     history[ply].castle_rights_prev = castle_rights; history[ply].halfmove_clock_prev = halfmove_clock; history[ply].hash_prev = hash_key;
     history[ply].npc_prev[WHITE]=non_pawn_count[WHITE]; history[ply].npc_prev[BLACK]=non_pawn_count[BLACK];
@@ -423,13 +427,13 @@ void make_move(Move m) {
     if (pt==PAWN && t==ep_square) {
         int ep_pawn = t + (side==WHITE ? -16 : 16);
         history[ply].piece_captured = board[ep_pawn]; board[ep_pawn] = EMPTY;
-        TOGGLE(xside, PAWN, ep_pawn);
+        toggle(xside, PAWN, ep_pawn);
     }
     board[t]=p; board[f]=EMPTY;
-    TOGGLE(side, pt, f); TOGGLE(side, pt, t);
-    if (cap) { TOGGLE(xside, TYPE(cap), t); if (TYPE(cap)>=KNIGHT && TYPE(cap)<=QUEEN) non_pawn_count[xside]--; }
+    toggle(side, pt, f); toggle(side, pt, t);
+    if (cap) { toggle(xside, piece_type(cap), t); if (piece_type(cap)>=KNIGHT && piece_type(cap)<=QUEEN) non_pawn_count[xside]--; }
 
-    if (pr) { board[t] = PIECE(side,pr); TOGGLE(side, pt, t); TOGGLE(side, pr, t);
+    if (pr) { board[t] = make_piece(side,pr); toggle(side, pt, t); toggle(side, pr, t);
               non_pawn_count[side]++; } /* pawn promoted to piece */
 
     hash_key ^= zobrist_castle[castle_rights];
@@ -437,8 +441,8 @@ void make_move(Move m) {
         king_sq[side] = t;
         for (int ci=0; ci<4; ci++) {
             if (f==castle_kf[ci] && t==castle_kt[ci]) {
-                board[castle_rf[ci]] = EMPTY; board[castle_rt[ci]] = PIECE(castle_col[ci], ROOK);
-                TOGGLE(castle_col[ci], ROOK, castle_rf[ci]); TOGGLE(castle_col[ci], ROOK, castle_rt[ci]);
+                board[castle_rf[ci]] = EMPTY; board[castle_rt[ci]] = make_piece(castle_col[ci], ROOK);
+                toggle(castle_col[ci], ROOK, castle_rf[ci]); toggle(castle_col[ci], ROOK, castle_rt[ci]);
                 break;
             }
         }
@@ -449,16 +453,17 @@ void make_move(Move m) {
 
     if (ep_square!=SQ_NONE) hash_key ^= zobrist_ep[ep_square];
     ep_square = SQ_NONE;
-    if (pt==PAWN && abs(t-f)==32) { ep_square = f + (side==WHITE ? 16 : -16); hash_key ^= zobrist_ep[ep_square]; }
+    if (pt==PAWN && ((t-f)==32 || (f-t)==32)) { ep_square = f + (side==WHITE ? 16 : -16); hash_key ^= zobrist_ep[ep_square]; }
 
     hash_key ^= zobrist_side; side^=1; xside^=1; ply++;
 }
 
 void undo_move(void) {
     ply--; side^=1; xside^=1;
-    Move m = history[ply].move; int f=FROM(m), t=TO(m), pr=PROMO(m);
-    board[f]=board[t]; board[t]=history[ply].piece_captured; int pt=TYPE(board[f]);
-    if (pr) board[f]=PIECE(side,PAWN);
+    Move m = history[ply].move; int f=move_from(m), t=move_to(m), pr=move_promo(m);
+    board[f]=board[t]; board[t]=history[ply].piece_captured;
+    if (pr) board[f]=make_piece(side,PAWN);
+    int pt=piece_type(board[f]);
 
     if (pt==PAWN && t==history[ply].ep_square_prev) {
         board[t]=EMPTY; board[t+(side==WHITE?-16:16)] = history[ply].piece_captured;
@@ -467,7 +472,7 @@ void undo_move(void) {
         king_sq[side]=f;
         for (int ci=0; ci<4; ci++) {
             if (f==castle_kf[ci] && t==castle_kt[ci]) {
-                board[castle_rt[ci]] = EMPTY; board[castle_rf[ci]] = PIECE(castle_col[ci], ROOK); break;
+                board[castle_rt[ci]] = EMPTY; board[castle_rf[ci]] = make_piece(castle_col[ci], ROOK); break;
             }
         }
     }
@@ -506,13 +511,13 @@ int generate_moves(Move *moves, int caps_only) {
 
     FOR_EACH_SQ(sq) {
         int p=board[sq];
-        if (!p || COLOR(p)!=side) continue;
-        int pt=TYPE(p);
+        if (!p || piece_color(p)!=side) continue;
+        int pt=piece_type(p);
 
         /* -- Pawns ------------------------------------------------ */
         if (pt==PAWN) {
             int tgt=sq+d_pawn;
-            if (!SQ_IS_OFF(tgt) && !board[tgt]) {
+            if (!sq_is_off(tgt) && !board[tgt]) {
                 if ((sq>>4)==pawn_promo) add_promo(moves, &cnt, sq, tgt);
                 else if (!caps_only) {
                     add_move(moves,&cnt,sq,tgt,0);
@@ -521,7 +526,7 @@ int generate_moves(Move *moves, int caps_only) {
             }
             for (int i=-1; i<=1; i+=2) {           /* diagonal captures + ep */
                 tgt=sq+d_pawn+i;
-                if (!SQ_IS_OFF(tgt) && ((board[tgt] && COLOR(board[tgt])==xside) || tgt==ep_square)) {
+                if (!sq_is_off(tgt) && ((board[tgt] && piece_color(board[tgt])==xside) || tgt==ep_square)) {
                     if ((sq>>4)==pawn_promo) add_promo(moves, &cnt, sq, tgt);
                     else add_move(moves,&cnt,sq,tgt,0);
                 }
@@ -532,11 +537,11 @@ int generate_moves(Move *moves, int caps_only) {
         /* -- Sliders & Leapers ------------------------------------ */
         for (int i=piece_offsets[pt]; i<piece_limits[pt]; i++) {
             int step=step_dir[i], tgt=sq+step;
-            while (!SQ_IS_OFF(tgt)) {
+            while (!sq_is_off(tgt)) {
                 if (!board[tgt]) {
                     if (!caps_only) add_move(moves,&cnt,sq,tgt,0);
                 } else {
-                    if (COLOR(board[tgt])==xside) add_move(moves,&cnt,sq,tgt,0);
+                    if (piece_color(board[tgt])==xside) add_move(moves,&cnt,sq,tgt,0);
                     break;
                 }
                 if (pt==KNIGHT || pt==KING) break;
@@ -553,8 +558,8 @@ int generate_moves(Move *moves, int caps_only) {
                 ac  = (castle_col[ci]==WHITE) ? BLACK : WHITE;
                 
                 if (sq != kf || castle_col[ci]!=side) continue;
-                if (!(castle_rights & bit)) continue;
-                if (board[rf] != PIECE(side,ROOK)) continue;
+                if (!(castle_rights & (unsigned int)bit)) continue;
+                if (board[rf] != make_piece(side,ROOK)) continue;
 
                 /* Every square between king and rook must be empty */
                 int sq1=(kf<rf)? kf+1 : rf+1, sq2=(kf<rf)? rf   : kf;
@@ -564,9 +569,9 @@ int generate_moves(Move *moves, int caps_only) {
                 if (!clear_ok) continue;
 
                 /* King's path must not traverse attacked squares */
-                int step = (kt>kf) ? 1 : -1;
+                int step2 = (kt>kf) ? 1 : -1;
                 clear_ok = 1;
-                for (int sq3=kf; sq3!=(kt+step); sq3+=step)
+                for (int sq3=kf; sq3!=(kt+step2); sq3+=step2)
                     if (is_square_attacked(sq3,ac)) { clear_ok=0; break; }
                 if (clear_ok) add_move(moves,&cnt,kf,kt,0);
             }
@@ -591,10 +596,23 @@ int generate_moves(Move *moves, int caps_only) {
    4. En-passant target square.
 */
 
+static int char_to_piece(char lo) {
+    switch (lo) {
+        case 'p': return PAWN;
+        case 'n': return KNIGHT;
+        case 'b': return BISHOP;
+        case 'r': return ROOK;
+        case 'q': return QUEEN;
+        case 'k': return KING;
+        default:  return EMPTY;
+    }
+}
+
 void parse_fen(const char *fen) {
     int rank=7, file=0;
 
     for (int i=0;i<128;i++) board[i]=EMPTY;
+    king_sq[WHITE] = king_sq[BLACK] = SQ_NONE;
     castle_rights=0; ep_square=SQ_NONE; ply=0; hash_key=0;
     non_pawn_count[WHITE]=0; non_pawn_count[BLACK]=0;
     memset(killers,0,sizeof(killers)); memset(pv,0,sizeof(pv));
@@ -605,26 +623,29 @@ void parse_fen(const char *fen) {
         else if (isdigit(*fen)) { file += *fen-'0'; }
         else {
             int sq=rank*16+file, color=isupper(*fen)?WHITE:BLACK; char lo=(char)tolower(*fen);
-            int piece=(lo=='p')?PAWN:(lo=='n')?KNIGHT:(lo=='b')?BISHOP:(lo=='r')?ROOK:(lo=='q')?QUEEN:KING;
-            board[sq]=PIECE(color,piece); if (piece==KING) king_sq[color]=sq;
+            int piece = char_to_piece(lo);
+            if (piece == EMPTY) { fen++; continue; }
+            board[sq]=make_piece(color,piece); if (piece==KING) king_sq[color]=sq;
             if (piece>=KNIGHT && piece<=QUEEN) non_pawn_count[color]++;
             file++;
         }
         fen++;
     }
-    fen++;
+    if (*fen) fen++;
 
     side=(*fen=='w')?WHITE:BLACK; xside=side^1;
-    fen+=2;
+    if (*fen) fen++;
+    if (*fen) fen++;
 
     while (*fen && *fen!=' ') {
         if (*fen=='K') { castle_rights|=1; } if (*fen=='Q') { castle_rights|=2; }
         if (*fen=='k') { castle_rights|=4; } if (*fen=='q') { castle_rights|=8; }
         fen++;
     }
-    fen++;
+    if (*fen) fen++;
 
-    if (*fen!='-') ep_square=(fen[1]-'1')*16+(fen[0]-'a');
+    if (*fen != '-' && *fen && fen[1])
+        ep_square = (fen[1]-'1')*16 + (fen[0]-'a');
 
     /* advance past ep field, then read halfmove clock */
     while (*fen && *fen != ' ') fen++;
@@ -750,10 +771,8 @@ int evaluate(void) {
     int pseudo_list[32]; /* occupied squares built during first pass (Pawel Koziol) */
     int index = 0, i;
 
-    mg[WHITE] = 0; mg[BLACK] = 0;
-    eg[WHITE] = 0; eg[BLACK] = 0;
-    phase = 0;
-    bishops[WHITE] = 0; bishops[BLACK] = 0;
+    mg[WHITE] = mg[BLACK] = eg[WHITE] = eg[BLACK] = phase = 0;
+    bishops[WHITE] = bishops[BLACK] = 0;
     memset(pawn_cnt, 0, sizeof(pawn_cnt));
 
     /* First pass: rank/file double loop visits exactly 64 valid squares
@@ -765,7 +784,7 @@ int evaluate(void) {
             int sq = rank * 16 + f;
             int p = board[sq]; if (!p) continue;
             pseudo_list[index++] = sq;                    /* memorize (Pawel) */
-            int pt = TYPE(p), color = COLOR(p);
+            int pt = piece_type(p), color = piece_color(p);
 
             /* Square index: rank 0 = White's back rank.
                Black mirrors vertically so its rank 0 is rank 7 in White terms. */
@@ -785,9 +804,9 @@ int evaluate(void) {
                 int mob = 0;
                 for (i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
                     int step = step_dir[i], target = sq + step;
-                    while (!SQ_IS_OFF(target)) {
+                    while (!sq_is_off(target)) {
                         if (board[target] == 0) { mob++; }
-                        else { if (COLOR(board[target]) != color) mob++; break; }
+                        else { if (piece_color(board[target]) != color) mob++; break; }
                         if (pt == KNIGHT) break;
                         target += step;
                     }
@@ -838,9 +857,8 @@ int evaluate(void) {
        the 32+ empty squares FOR_EACH_SQ would visit (Pawel Koziol).
        Applied to both MG and EG: an open rook is valuable in all phases. */
     for (i = 0; i < index; i++) {
-        int sq = pseudo_list[i];
-        int p  = board[sq];
-        int pt = TYPE(p), color = COLOR(p), f = sq & 7;
+        int sq = pseudo_list[i], p = board[sq];
+        int pt = piece_type(p), color = piece_color(p), f = sq & 7;
         if (pt == ROOK) {
             int rank = sq >> 4, bonus = 0;
             if (pawn_cnt[color][f] == 0)
@@ -857,11 +875,9 @@ int evaluate(void) {
            (mg_score * phase + eg_score * (24 - phase)) / 24
        gives pure MG at phase=24 and pure EG at phase=0. */
     if (phase > 24) phase = 24;
-    {
-        int mg_score = mg[side] - mg[side^1];
-        int eg_score = eg[side] - eg[side^1];
-        return (mg_score * phase + eg_score * (24 - phase)) / 24;
-    }
+    int mg_score = mg[side] - mg[side^1];
+    int eg_score = eg[side] - eg[side^1];
+    return (mg_score * phase + eg_score * (24 - phase)) / 24;
 }
 
 /* ===============================================================
@@ -874,34 +890,34 @@ int evaluate(void) {
    O(b^d) to O(b^(d/2)), doubling search depth effectively at zero cost.
 
    Implementation
-   We score every generated move before searching. A simple Selection
-   Sort strictly orders the moves sequentially by these priorities:
-   1. Hash Move (20000): The globally proven best move from the TT.
-   2. MVV-LVA (1000+): Prioritizes capturing valuable pieces using cheap 
-      attackers (e.g., Pawn takes Queen).
-   3. Killers (800): High-performing quiet moves discovered earlier 
-      at the same depth.
-   4. History Heuristic (1..799): Historical reputation of quiet moves.
+   We score every generated move before searching, then pick the best
+   lazily (one selection-sort step per move searched).
+   1. Hash move      (30000):  TT best move from a prior search.
+   2. MVV-LVA        (20000+): 20000 + 10*cap_val - atk_val.
+   3. Promotion      (19999):  Queen underpromotion.
+   4. Killer slot 0  (19998):  Most recent quiet beta-cutoff at this ply.
+   5. Killer slot 1  (19997):  Older quiet beta-cutoff at this ply.
+   6. History        (1..19996): Accumulated depth^2 credit on quiet cutoffs.
 */
 
-static inline int score_move(Move m, Move hash_move, int depth) {
+static inline int score_move(Move m, Move hash_move, int sply) {
     int cap, sc=0;
     if (m==hash_move) return 30000;
-    cap=board[TO(m)];
+    cap=board[move_to(m)];
     /* EP captures land on an empty square; treat them as pawn captures for ordering. */
-    if (!cap && TYPE(board[FROM(m)])==PAWN && TO(m)==ep_square)
-        cap=PIECE(xside,PAWN);
-    if (cap)           sc=20000+10*piece_val[TYPE(cap)]-piece_val[TYPE(board[FROM(m)])];
-    else if (PROMO(m)) sc=19999;
-    else if (depth<MAX_PLY && m==killers[depth][0]) sc=19998;
-    else if (depth<MAX_PLY && m==killers[depth][1]) sc=19997;
-    else               { int h=hist[FROM(m)][TO(m)]; sc=(h>19996)?19996:h; }
+    if (!cap && piece_type(board[move_from(m)])==PAWN && move_to(m)==ep_square)
+        cap=make_piece(xside,PAWN);
+    if (cap)                sc=20000+10*piece_val[piece_type(cap)]-piece_val[piece_type(board[move_from(m)])];
+    else if (move_promo(m)) sc=19999;
+    else if (sply<MAX_PLY && m==killers[sply][0]) sc=19998;
+    else if (sply<MAX_PLY && m==killers[sply][1]) sc=19997;
+    else               { int h=hist[move_from(m)][move_to(m)]; sc=(h>19996)?19996:h; }
     return sc;
 }
 
 /* Score all moves into a parallel array. Called once before the move loop. */
-static void score_moves(Move *moves, int *scores, int n, Move hash_move, int depth) {
-    for (int i = 0; i < n; i++) scores[i] = score_move(moves[i], hash_move, depth);
+static void score_moves(Move *moves, int *scores, int n, Move hash_move, int sply) {
+    for (int i = 0; i < n; i++) scores[i] = score_move(moves[i], hash_move, sply);
 }
 
 /* Partial sort: swap the best remaining move to position idx.
@@ -914,7 +930,7 @@ static void pick_move(Move *moves, int *scores, int n, int idx) {
     if (best != idx) {
         int ts = scores[idx]; scores[idx] = scores[best]; scores[best] = ts;
         Move tm = moves[idx];  moves[idx]  = moves[best];  moves[best]  = tm;
-            }
+    }
 }
 
 /* ===============================================================
@@ -957,9 +973,9 @@ static void pick_move(Move *moves, int *scores, int n, int idx) {
 
 int search(int depth, int alpha, int beta, int was_null, int sply) {
     Move moves[256], best=0, hash_move=0;
-    int legal=0, best_sc, old_alpha=alpha, sc;
+    int legal=0, quiet=0, best_sc, old_alpha=alpha, sc;
     int is_pv = (beta - alpha > 1); /* PV node: wide window, not a null-window probe */
-    TTEntry *e = &tt[hash_key % TT_SIZE];
+    TTEntry *e = &tt[hash_key % (HASH)tt_size];
 
     /* Clear PV at this ply before any early returns (TT hits, stand-pat, repetition).
        If we return early the parent reads pv_length[sply] to know how much of the
@@ -970,7 +986,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
        Every 1024 nodes, check if we have exceeded our absolute time budget.
        If we have, abort the search tree immediately to prevent flagging. */
     if ((nodes_searched & 1023) == 0 && time_budget_ms > 0) {
-        long ms = (long)((clock() - t_start) * 1000 / CLOCKS_PER_SEC);
+        int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
         if (ms >= time_budget_ms) { time_over_flag = 1; return 0; }
     }
     if (time_over_flag) return 0;
@@ -1012,7 +1028,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
     if (non_pawn_count[WHITE] + non_pawn_count[BLACK] <= 1) {
         int s2, has_pawn = 0, has_major = 0;
         FOR_EACH_SQ(s2) {
-            int pt = TYPE(board[s2]);
+            int pt = piece_type(board[s2]);
             if (pt == PAWN)                has_pawn  = 1;
             if (pt == ROOK || pt == QUEEN) has_major = 1;
         }
@@ -1022,8 +1038,8 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
     /* TT probe: always extract hash_move for ordering */
     if (e->key == hash_key) {
         hash_move = e->best_move;
-        if ((int)TT_DEPTH(e) >= depth) {
-            int flag = TT_FLAG(e);
+        if ((int)tt_depth(e) >= depth) {
+            int flag = tt_flag(e);
             /* Mate scores are stored relative to the node that proved them
                (+sply on write) so the same position compares correctly when
                retrieved via a transposition at a different search depth.
@@ -1054,7 +1070,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
        static_eval is computed once and reused; no second evaluate() call. */
     if (!caps_only && depth >= 1 && depth <= 7
         && beta < MATE - MAX_PLY
-        && !IN_CHECK(side)) {
+        && !in_check(side)) {
         int static_eval = evaluate();
         if (static_eval - 70 * depth >= beta)
             return static_eval - 70 * depth;
@@ -1069,10 +1085,9 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
        move has no non-pawn non-king piece, making the null move
        assumption safe in all normal middlegame and endgame positions.  */
     if (!caps_only && !is_pv && !was_null && depth >= 3 && non_pawn_count[side] > 0
-        && !IN_CHECK(side)) {
-        int ep_sq_prev, R;
-        R = (depth >= 6) ? 3 : 2;
-        ep_sq_prev = ep_square;
+        && !in_check(side)) {
+        int R = (depth >= 6) ? 3 : 2;
+        int ep_sq_prev = ep_square;
         hash_key ^= zobrist_side;
         if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
         ep_square = SQ_NONE;
@@ -1094,20 +1109,30 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         /* DELTA PRUNING (Quiescence only)
            If capturing this piece plus a safety margin can't possibly
            raise alpha, skip generating the recursive tree. */
-        if (caps_only && board[TO(moves[i])]) {
-            int cap_val = piece_val[TYPE(board[TO(moves[i])])];
+        if (caps_only && board[move_to(moves[i])]) {
+            int cap_val = piece_val[piece_type(board[move_to(moves[i])])];
             if (best_sc + cap_val + 200 < alpha) continue;
         }
 
         /* Capture flag must be read before make_move: after the call
            board[TO] always holds a piece, making a post-move test useless.
            En-passant has an empty destination, so check ep_square too.    */
-        int is_cap = board[TO(moves[i])] != 0
-                     || (TYPE(board[FROM(moves[i])]) == PAWN
-                         && TO(moves[i]) == ep_square);
+        int is_cap = board[move_to(moves[i])] != 0
+                     || (piece_type(board[move_from(moves[i])]) == PAWN
+                         && move_to(moves[i]) == ep_square);
         make_move(moves[i]);
-        if (ILLEGAL) { undo_move(); continue; }
+        if (is_illegal()) { undo_move(); continue; }
         legal++;
+        if (!is_cap) quiet++;
+
+        /* LATE MOVE PRUNING (LMP)
+           At shallow depths, skip quiet moves beyond the first few.
+           The threshold scales with depth so we never prune at depth 1
+           (4*1+1=5 quiet moves allowed) through depth 3 (13 allowed).
+           Moves that give check are exempted: they may be the only defence. */
+        if (!caps_only && !is_pv && depth < 4 && quiet > 4 * depth + 1) {
+            if (!in_check(side)) { undo_move(); continue; }
+        }
 
         /* PRINCIPAL VARIATION SEARCH + LMR
            First legal move searched with full window to establish the PV.
@@ -1115,28 +1140,30 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
            if our current best is truly best they should fail low cheaply.
            Late quiet moves (legal>=4, depth>=3, no check, no capture) are
            additionally reduced by one ply before the null-window probe.
-           Any null-window beat that escapes [alpha,beta) forces a full
-           re-search at depth-1 to get an exact score.
-           QS uses a plain full-window search for every capture -- the
-           null-window overhead is not worth it in a captures-only loop. */
+           Any null-window beat that escapes alpha forces a full re-search
+           at depth-1 to get an exact score.  The `sc < beta` upper-bound
+           guard is omitted intentionally: in modern PVS the re-search will
+           simply fail-high and that score is still valid (it is >= beta,
+           which the parent will cut off anyway). */
         if (caps_only || legal == 1) {
             sc = -search(depth - 1, -beta, -alpha, 0, sply + 1);
         } else {
             /* After make_move the side globals are swapped: side is now the
-               opponent, so IN_CHECK(side) tests whether our move gives check. */
-            int gives_check = IN_CHECK(side);
+               opponent, so in_check(side) tests whether our move gives check. */
+            int gives_check = in_check(side);
             int lmr = (!is_pv && depth >= 3 && legal >= 4
-                       && !is_cap && !PROMO(moves[i]) && !gives_check);
+                       && !is_cap && !move_promo(moves[i]) && !gives_check);
             sc = -search(lmr ? depth - 2 : depth - 1, -alpha - 1, -alpha, 0, sply + 1);
-            if (sc > alpha && sc < beta)
+            if (sc > alpha)
                 sc = -search(depth - 1, -beta, -alpha, 0, sply + 1);
         }
 
         undo_move();
 
-        if (sc > best_sc) { best_sc = sc; best = moves[i]; }
+        if (sc > best_sc) best_sc = sc;
         if (sc > alpha) {
             alpha = sc;
+            best = moves[i];              /* moved here -- only update when alpha raised */
             /* Triangular PV update: store this move, then copy the child
                ply's continuation into the current row of the table. */
             pv[sply][sply] = moves[i];
@@ -1145,15 +1172,15 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
             pv_length[sply] = pv_length[sply+1];
         }
         if (alpha >= beta) {
-            if (!board[TO(moves[i])]) {   /* quiet cutoff move */
+            if (!board[move_to(moves[i])]) {   /* quiet cutoff move */
                 int d = (sply < MAX_PLY) ? sply : MAX_PLY - 1;
                 int bonus = depth * depth;
                 killers[d][1] = killers[d][0];
                 killers[d][0] = moves[i];
                 /* History: credit the (from,to) pair, not just the destination.
                    This keeps Nf3 and Bf3 separate. Cap at 32000 (never wraps). */
-                int h = hist[FROM(moves[i])][TO(moves[i])] + bonus;
-                hist[FROM(moves[i])][TO(moves[i])] = (h > 32000) ? 32000 : h;
+                int h = hist[move_from(moves[i])][move_to(moves[i])] + bonus;
+                hist[move_from(moves[i])][move_to(moves[i])] = (h > 32000) ? 32000 : h;
             }
             break;
         }
@@ -1161,10 +1188,10 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
 
     /* Checkmate or stalemate (only detectable in full search, not QS) */
     if (!caps_only && !legal)
-        return IN_CHECK(side) ? -(MATE - sply) : 0;
+        return in_check(side) ? -(MATE - sply) : 0;
 
     /* TT store: skip if search was aborted mid-tree (score is meaningless) */
-    if (!time_over_flag && best && (e->key != hash_key || depth >= (int)TT_DEPTH(e))) {
+    if (!time_over_flag && best && (e->key != hash_key || depth >= (int)tt_depth(e))) {
         int flag = (best_sc <= old_alpha) ? TT_ALPHA :
                    (best_sc >= beta)      ? TT_BETA  : TT_EXACT;
         /* Encode mate scores as distance-from-node (+sply) so the score
@@ -1173,7 +1200,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         if (sc_store >  MATE - MAX_PLY) sc_store += sply;
         if (sc_store < -(MATE - MAX_PLY)) sc_store -= sply;
         e->key = hash_key; e->score = sc_store; e->best_move = best;
-        e->depth_flag = TT_PACK(depth > 0 ? depth : 0, flag);
+        e->depth_flag = tt_pack(depth > 0 ? depth : 0, flag);
     }
     return best_sc;
 }
@@ -1186,12 +1213,10 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
 */
 
 void print_move(Move m) {
-    int f=FROM(m), t=TO(m), pr=PROMO(m);
-    char pc=0;
-    if (pr==QUEEN) pc='q'; else if (pr==ROOK) pc='r';
-    else if (pr==BISHOP) pc='b'; else if (pr==KNIGHT) pc='n';
-    if (pc) printf("%c%c%c%c%c",'a'+(f&7),'1'+(f>>4),'a'+(t&7),'1'+(t>>4),pc);
-    else    printf("%c%c%c%c",  'a'+(f&7),'1'+(f>>4),'a'+(t&7),'1'+(t>>4));
+    static const char promo_ch[7] = {0,0,'n','b','r','q',0}; /* KNIGHT=2..QUEEN=5 */
+    int f=move_from(m), t=move_to(m), pr=move_promo(m);
+    printf("%c%c%c%c", 'a'+(f&7), '1'+(f>>4), 'a'+(t&7), '1'+(t>>4));
+    if (pr && pr < 7) putchar(promo_ch[pr]);
 }
 
 static void print_pv(void) {
@@ -1223,14 +1248,12 @@ static void print_pv(void) {
 void search_root(int max_depth) {
     Move moves[256], global_best=0, iter_best;
     int cnt = generate_moves(moves, 0);
-    int best_sc = -INF, legal_root = 0;
-    int sply = 0;
-    long total_nodes = 0;
+    int best_sc = -INF, legal_root = 0, sply = 0;
+    int64_t total_nodes = 0;
 
     time_over_flag = 0;
     t_start = clock();
-    memset(hist, 0, sizeof(hist));
-    memset(killers, 0, sizeof(killers));
+    memset(hist, 0, sizeof(hist)); memset(killers, 0, sizeof(killers));
 
     int root_scores[256];
     score_moves(moves, root_scores, cnt, 0, 0);
@@ -1276,7 +1299,7 @@ void search_root(int max_depth) {
             for (int i=0; i<cnt; i++) {
                 pick_move(moves, root_scores, cnt, i);
                 make_move(moves[i]);
-                if (ILLEGAL) { undo_move(); continue; }
+                if (is_illegal()) { undo_move(); continue; }
                 if (d==1) {
                     legal_root++;
                     if (!global_best) global_best = moves[i]; /* Immediate fallback */
@@ -1294,14 +1317,15 @@ void search_root(int max_depth) {
                 }
                 undo_move();
                 if (time_over_flag) break; /* Abort this depth entirely */
-                if (sc>best_sc) {
-                    best_sc=sc; iter_best=moves[i];
+                if (sc>best_sc) best_sc=sc;
+                if (sc > asp_lo) {
+                    asp_lo = sc;
+                    iter_best = moves[i];         /* only when alpha raised */
                     /* Propagate PV from depth 1 up to the root (sply=0) */
                     pv[0][0]=moves[i];
                     for (int k=1; k<pv_length[1]; k++) pv[0][k]=pv[1][k];
                     pv_length[0]=pv_length[1];
                 }
-                if (sc > asp_lo) asp_lo = sc;
             }
 
             if (time_over_flag) break; /* Don't use incomplete depth data */
@@ -1344,16 +1368,15 @@ void search_root(int max_depth) {
            The move-count formula:
              mating:  N =  (MATE - score + 1) / 2
              mated:   N = -(MATE + score + 1) / 2    */
-        {
-            long ms=(long)((clock()-t_start)*1000/CLOCKS_PER_SEC);
+            int64_t ms = (int64_t)(((int64_t)(clock()-t_start)*1000) / CLOCKS_PER_SEC);
             if (best_sc > MATE - MAX_PLY)
-                printf("info depth %d score mate %d nodes %ld time %ld pv",
+                printf("info depth %d score mate %d nodes %" PRId64 " time %" PRId64 " pv",
                        d, (MATE - best_sc + 1)/2, total_nodes, ms);
             else if (best_sc < -(MATE - MAX_PLY))
-                printf("info depth %d score mate %d nodes %ld time %ld pv",
+                printf("info depth %d score mate %d nodes %" PRId64 " time %" PRId64 " pv",
                        d, -(MATE + best_sc + 1)/2, total_nodes, ms);
             else
-                printf("info depth %d score cp %d nodes %ld time %ld pv",
+                printf("info depth %d score cp %d nodes %" PRId64 " time %" PRId64 " pv",
                        d, best_sc, total_nodes, ms);
             print_pv();
             printf("\n");
@@ -1366,7 +1389,6 @@ void search_root(int max_depth) {
                budget, the next depth will almost certainly exceed it,
                so we stop now rather than risk overshoot. */
             if (time_budget_ms > 0 && ms >= time_budget_ms / 2) break;
-        }
     }
 
     /* ROOT MATE / STALEMATE DETECTION
@@ -1376,9 +1398,9 @@ void search_root(int max_depth) {
        "bestmove 0000" silently -- report the correct terminal score
        and let the GUI handle the game-over condition.            */
     if (!legal_root) {
-        int in_check = IN_CHECK(side);
+        int is_in_check = in_check(side);
         printf("info depth 0 score mate %d nodes 0 time 0 pv\n",
-               in_check ? 0 : 0);   /* 0 = already mated / stalemated */
+               is_in_check ? 0 : 0);   /* 0 = already mated / stalemated */
         fflush(stdout);
     }
 
@@ -1404,14 +1426,14 @@ void search_root(int max_depth) {
    the numbers are fully deterministic.
 */
 
-long perft(int depth) {
+int64_t perft(int depth) {
     if (!depth) return 1;
     Move moves[256];
     int cnt = generate_moves(moves, 0);
-    long n = 0;
+    int64_t n = 0;
     for (int i = 0; i < cnt; i++) {
         make_move(moves[i]);
-        if (!ILLEGAL) n += perft(depth-1);
+        if (!is_illegal()) n += perft(depth-1);
         undo_move();
     }
     return n;
@@ -1438,60 +1460,77 @@ static int parse_move(const char *s, Move *out) {
     if (!s||strlen(s)<4) return 0;
     f=(s[0]-'a')+(s[1]-'1')*16;
     t=(s[2]-'a')+(s[3]-'1')*16;
-    if (strlen(s)>4) {
-        char c=(char)tolower(s[4]);
-        if (c=='q') pr=QUEEN; else if (c=='r') pr=ROOK;
-        else if (c=='b') pr=BISHOP; else if (c=='n') pr=KNIGHT;
-    }
+    if (strlen(s)>4) pr = char_to_piece((char)tolower(s[4]));
     cnt=generate_moves(list,0);
     for (i=0;i<cnt;i++)
-        if (FROM(list[i])==f&&TO(list[i])==t&&PROMO(list[i])==pr) { *out=list[i]; return 1; }
+        if (move_from(list[i])==f&&move_to(list[i])==t&&move_promo(list[i])==pr) { *out=list[i]; return 1; }
     return 0;
 }
 
 /* Helpers for uci_loop */
-#define STARTPOS "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+static const char STARTPOS[] = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
-/* GETVAL: find keyword k in `line`, then parse the value that follows.
-   sizeof(k)-1 gives the string length of k (sizeof counts the '\0').
-   +1 skips the space between the keyword and its value.
-   e.g. GETVAL("depth", "%d", depth) on "go depth 6" -> depth=6. */
-#define GETVAL(k,fmt,v) { char *_t=strstr(line,(k)); if (_t) sscanf(_t+sizeof(k)-1+1,(fmt),&(v)); }
+/* getval: find `key` in `line`, skip one space, then scan into `out` with `fmt`.
+   Uses strlen so it works on any runtime string, not just string literals.
+   e.g. getval(line, "depth", "%d", &depth) on "go depth 6" -> depth=6. */
+static void getval(const char *line, const char *key, const char *fmt, void *out) {
+    const char *t = strstr(line, key);
+    if (t) sscanf(t + strlen(key) + 1, fmt, out);
+}
 
 void uci_loop(void) {
     char line[65536], *p;
     Move m;
 
-    /* Fixed seed suggested by Pawel Koziol (nescitus).
-       Reproducible Zobrist keys make TT bugs traceable across runs.
-       Seed: Pawel's birthday. */
-    srand(19791218);
     init_zobrist();
     parse_fen(STARTPOS);
     hash_key=generate_hash();
 
+    tt = calloc((size_t)tt_size, sizeof(TTEntry));
+    if (!tt) { fprintf(stderr, "Error: failed to allocate TT (%lld entries)\n",
+                       (long long)tt_size); exit(1); }
+
     while (fgets(line,sizeof(line),stdin)) {
         if (!strncmp(line,"uci",3)) {
-            printf("id name Chal\nid author Naman Thanki\nuciok\n");
+            printf("id name Chal\nid author Naman Thanki\n");
+            printf("option name Hash type spin default 16 min 1 max 4096\n");
+            printf("uciok\n");
             fflush(stdout);
+        }
+        else if (!strncmp(line,"setoption",9)) {
+            /* setoption name Hash value <N>  (N in megabytes) */
+            char *nptr = strstr(line, "name Hash value ");
+            if (nptr) {
+                int mb = 0;
+                sscanf(nptr + 16, "%d", &mb);
+                if (mb < 1) mb = 1;
+                int64_t new_size = ((int64_t)mb * 1024 * 1024) / (int64_t)sizeof(TTEntry);
+                if (new_size < 1) new_size = 1;
+                TTEntry *new_tt = calloc((size_t)new_size, sizeof(TTEntry));
+                if (new_tt) {
+                    free(tt);
+                    tt = new_tt;
+                    tt_size = new_size;
+                }
+            }
         }
         else if (!strncmp(line,"isready",7)) {
             printf("readyok\n"); fflush(stdout);
         }
         else if (!strncmp(line,"ucinewgame",10)) {
-            memset(tt,   0, sizeof(tt));
-            memset(hist, 0, sizeof(hist));
+            memset(tt, 0, (size_t)tt_size * sizeof(TTEntry)); memset(hist, 0, sizeof(hist));
             parse_fen(STARTPOS);
             hash_key = generate_hash();
         }
         else if (!strncmp(line,"perft",5)) {
-            int depth=4; long n;
+            int depth=4; int64_t n;
             sscanf(line,"perft %d",&depth);
             n=perft(depth);
-            printf("perft depth %d nodes %ld\n",depth,n);
+            printf("perft depth %d nodes %" PRId64 "\n",depth,n);
             fflush(stdout);
         }
         else if (!strncmp(line,"position",8)) {
+            if (strlen(line) <= 9) continue;
             p=line+9;
             if (!strncmp(p,"startpos",8)) {
                 parse_fen(STARTPOS);
@@ -1505,11 +1544,13 @@ void uci_loop(void) {
                 p+=6;
                 while (*p) {
                     char mv[6];
+                    int n = 0;
                     while (*p==' ') p++;
                     if (*p=='\n'||!*p) break;
-                    sscanf(p,"%5s",mv);
+                    sscanf(p,"%5s%n",mv,&n);
+                    if (n <= 0) break;
                     if (parse_move(mv,&m)) make_move(m);
-                    p+=strlen(mv);
+                    p+=n;
                 }
             }
         }
@@ -1542,18 +1583,18 @@ void uci_loop(void) {
                returns the best move from the last fully searched depth. */
 
             int  depth   = MAX_PLY;
-            long wtime=0, btime=0, movestogo=30, winc=0, binc=0;
+            int64_t wtime=0, btime=0, movestogo=30, winc=0, binc=0;
 
-            GETVAL("depth",    "%d",  depth)
-            GETVAL("wtime",    "%ld", wtime)
-            GETVAL("btime",    "%ld", btime)
-            GETVAL("movestogo","%ld", movestogo)
-            GETVAL("winc",     "%ld", winc)
-            GETVAL("binc",     "%ld", binc)
+            getval(line, "depth",     "%d",          &depth);
+            getval(line, "wtime",     "%" SCNd64,    &wtime);
+            getval(line, "btime",     "%" SCNd64,    &btime);
+            getval(line, "movestogo", "%" SCNd64,    &movestogo);
+            getval(line, "winc",      "%" SCNd64,    &winc);
+            getval(line, "binc",      "%" SCNd64,    &binc);
 
             if (wtime || btime) {
-                long our_time = (side==WHITE) ? wtime  : btime;
-                long our_inc  = (side==WHITE) ? winc   : binc;
+                int64_t our_time = (side==WHITE) ? wtime  : btime;
+                int64_t our_inc  = (side==WHITE) ? winc   : binc;
                 if (movestogo <= 0) movestogo = 30;
                 time_budget_ms = (our_time / movestogo) + (our_inc * 3 / 4);
                 if (time_budget_ms > our_time - 50) time_budget_ms = our_time - 50;
@@ -1568,6 +1609,7 @@ void uci_loop(void) {
             break;
         }
     }
+    free(tt);
 }
 
 /* ===============================================================

@@ -38,6 +38,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <math.h>
 
 /* ===============================================================
    S1  CONSTANTS & TYPES
@@ -174,10 +175,11 @@ Move pv[MAX_PLY][MAX_PLY];
 int  pv_length[MAX_PLY];
 
 /* HISTORY TABLE
-   hist[from][to] accumulates depth^2 credit every time the quiet move
-   from->to causes a beta cutoff. Indexed by both squares (not just the
-   destination) so Nf3 and Bf3 never share a bucket. Reset at the start
-   of each search_root call. Capped at 32000 to prevent overflow.        */
+   hist[from][to] holds a score in [-16000, 16000]:
+     +bonus (depth^2) each time from->to causes a beta cutoff (bonus).
+     -bonus for every other quiet move searched before that cutoff (malus).
+   Indexed by both squares so Nf3 and Bf3 never share a bucket.
+   Reset at the start of each search_root call.                          */
 int hist[128][128];
 
 /* TIME MANAGEMENT GLOBALS */
@@ -403,11 +405,11 @@ static inline int is_illegal(void)  { return is_square_attacked(king_sq[xside], 
 
 static inline void add_move(Move *list, int *n, int f, int t, int pr) { list[(*n)++] = make_move_enc(f,t,pr); }
 
+/* Add all four promotion possibilities for a pawn move from f to t. */
 static void add_promo(Move *list, int *n, int f, int t) {
-    add_move(list, n, f, t, QUEEN);
-    add_move(list, n, f, t, ROOK);
-    add_move(list, n, f, t, BISHOP);
-    add_move(list, n, f, t, KNIGHT);
+    for (int pr = QUEEN; pr >= KNIGHT; pr--) {
+        add_move(list, n, f, t, pr);
+    }
 }
 
 /* XOR piece (color c, type p) at sq in or out of the running Zobrist hash.
@@ -897,7 +899,9 @@ int evaluate(void) {
    3. Promotion      (19999):  Queen underpromotion.
    4. Killer slot 0  (19998):  Most recent quiet beta-cutoff at this ply.
    5. Killer slot 1  (19997):  Older quiet beta-cutoff at this ply.
-   6. History        (1..19996): Accumulated depth^2 credit on quiet cutoffs.
+   6. History   (-16000..16000): Bonus/malus from beta-cutoff tracking.
+      Negative scores are intentional: they push failing moves to the bottom
+      of the ordering without ever skipping them entirely.
 */
 
 static inline int score_move(Move m, Move hash_move, int sply) {
@@ -911,7 +915,7 @@ static inline int score_move(Move m, Move hash_move, int sply) {
     else if (move_promo(m)) sc=19999;
     else if (sply<MAX_PLY && m==killers[sply][0]) sc=19998;
     else if (sply<MAX_PLY && m==killers[sply][1]) sc=19997;
-    else               { int h=hist[move_from(m)][move_to(m)]; sc=(h>19996)?19996:h; }
+    else                    sc=hist[move_from(m)][move_to(m)];  /* [-16000, 16000] */
     return sc;
 }
 
@@ -970,6 +974,28 @@ static void pick_move(Move *moves, int *scores, int n, int idx) {
       immediately; 2 prior occurrences in game history (3-fold total) also
       returns draw. Bounded by halfmove_clock to skip irreversible positions.
 */
+
+/* ---------------------------------------------------------------
+   ADAPTIVE LMR REDUCTION TABLE
+   Reduction R scales with both search depth and move number:
+     R = round(ln(depth) * ln(move_number) / 1.6), clamped to [1, 5].
+   No reduction for depth < 3 or move_number < 4 (threshold guard).
+   "Adaptive" because R grows continuously rather than using fixed
+   buckets (0 / 1 / 2), better matching the empirical cost-benefit
+   curve of late-move pruning at increasing depths.
+--------------------------------------------------------------- */
+static int lmr_table[32][64];
+
+static void init_lmr(void) {
+    int d, m;
+    for (d = 0; d < 32; d++)
+        for (m = 0; m < 64; m++) {
+            if (d < 3 || m < 4) { lmr_table[d][m] = 0; continue; }
+            double r = log((double)d) * log((double)m) / 1.6;
+            int ri = (int)(r + 0.5);   /* round */
+            lmr_table[d][m] = ri < 1 ? 1 : ri > 5 ? 5 : ri;
+        }
+}
 
 int search(int depth, int alpha, int beta, int was_null, int sply) {
     Move moves[256], best=0, hash_move=0;
@@ -1086,7 +1112,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
        assumption safe in all normal middlegame and endgame positions.  */
     if (!caps_only && !is_pv && !was_null && depth >= 3 && non_pawn_count[side] > 0
         && !in_check(side)) {
-        int R = (depth >= 6) ? 3 : 2;
+        int R = (depth >= 7) ? 4 : 3;
         int ep_sq_prev = ep_square;
         hash_key ^= zobrist_side;
         if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
@@ -1103,6 +1129,9 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
     int cnt = generate_moves(moves, caps_only);
     int scores[256];
     score_moves(moves, scores, cnt, hash_move, sply);
+    /* Track quiet moves in order so the malus loop has an explicit list
+       (avoids re-checking board[] state after moves are undone). */
+    Move quiet_moves[256]; int nquiet = 0;
 
     for (int i = 0; i < cnt; i++) {
         pick_move(moves, scores, cnt, i);
@@ -1123,7 +1152,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         make_move(moves[i]);
         if (is_illegal()) { undo_move(); continue; }
         legal++;
-        if (!is_cap) quiet++;
+        if (!is_cap) { quiet++; if (nquiet < 256) quiet_moves[nquiet++] = moves[i]; }
 
         /* LATE MOVE PRUNING (LMP)
            At shallow depths, skip quiet moves beyond the first few.
@@ -1138,24 +1167,49 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
            First legal move searched with full window to establish the PV.
            All subsequent moves use a null window (-alpha-1,-alpha) since
            if our current best is truly best they should fail low cheaply.
-           Late quiet moves (legal>=4, depth>=3, no check, no capture) are
-           additionally reduced by one ply before the null-window probe.
-           Any null-window beat that escapes alpha forces a full re-search
-           at depth-1 to get an exact score.  The `sc < beta` upper-bound
-           guard is omitted intentionally: in modern PVS the re-search will
-           simply fail-high and that score is still valid (it is >= beta,
-           which the parent will cut off anyway). */
+           The `sc < beta` upper-bound guard is omitted intentionally: 
+           in modern PVS the re-search will simply fail-high and that score 
+           is still valid (it is >= beta, which the parent will cut off anyway). */
         if (caps_only || legal == 1) {
             sc = -search(depth - 1, -beta, -alpha, 0, sply + 1);
         } else {
-            /* After make_move the side globals are swapped: side is now the
-               opponent, so in_check(side) tests whether our move gives check. */
+            /* Adaptive LMR: late quiet moves are searched at a reduced depth
+               R drawn from lmr_table (log-scaled by depth and move number).
+               Any move whose reduced score beats alpha is re-searched at full
+               depth to get an exact score before updating alpha/best. */
+
+            int is_reduced = 0; // are we doing a reduced search?
             int gives_check = in_check(side);
-            int lmr = (!is_pv && depth >= 3 && legal >= 4
-                       && !is_cap && !move_promo(moves[i]) && !gives_check);
-            sc = -search(lmr ? depth - 2 : depth - 1, -alpha - 1, -alpha, 0, sply + 1);
-            if (sc > alpha)
-                sc = -search(depth - 1, -beta, -alpha, 0, sply + 1);
+            /* ADAPTIVE LMR: reduction R = lmr_table[depth][move_number],
+               precomputed as round(ln(d)*ln(m)/1.6).  Captures, promotions,
+               and check-giving moves skip reduction entirely.  R is capped so
+               we never reduce past depth 1 (i.e. never drop into qsearch). */
+            int d_clamped = depth < 32 ? depth : 31;
+            int m_clamped = legal < 64 ? legal : 63;
+            int lmr = (!is_cap && !move_promo(moves[i]) && !gives_check)
+                      ? lmr_table[d_clamped][m_clamped] : 0;
+            
+            // Increase reduction in non-PV nodes (they're expected to fail low anyway)
+            if (!is_pv && lmr > 0) lmr += 1;
+            
+            // Never drop to depth 0 or below
+            if (lmr > depth - 2) lmr = depth - 2;
+            if (lmr < 0) lmr = 0;
+            
+            if (lmr > 0) {
+                // reduced depth + null window
+                sc = -search(depth - 1 - lmr, -alpha - 1, -alpha, 0, sply + 1); 
+                if (sc <= alpha) is_reduced = 1; // failed low, skip re-search
+            }
+
+            if (!is_reduced) {
+                // full depth + full window
+                sc = -search(depth - 1, -alpha - 1, -alpha, 0, sply + 1);
+                if (sc > alpha && is_pv) {
+                    // full window only on PV nodes
+                    sc = -search(depth - 1, -beta, -alpha, 0, sply + 1);
+                }
+            }
         }
 
         undo_move();
@@ -1177,10 +1231,19 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
                 int bonus = depth * depth;
                 killers[d][1] = killers[d][0];
                 killers[d][0] = moves[i];
-                /* History: credit the (from,to) pair, not just the destination.
-                   This keeps Nf3 and Bf3 separate. Cap at 32000 (never wraps). */
-                int h = hist[move_from(moves[i])][move_to(moves[i])] + bonus;
-                hist[move_from(moves[i])][move_to(moves[i])] = (h > 32000) ? 32000 : h;
+                /* History BONUS: reward the cutoff move.
+                   History MALUS:  penalise every quiet move tried before it.
+                   Both use the gravity formula: base update +/- bonus, then
+                   subtract a fraction of the current value (diminishing returns)
+                   so entries self-correct instead of saturating at ±16000. */
+                int h = hist[move_from(moves[i])][move_to(moves[i])];
+                h += bonus - h * bonus / 16000;
+                hist[move_from(moves[i])][move_to(moves[i])] = h > 16000 ? 16000 : h;
+                for (int j = 0; j < nquiet - 1; j++) {
+                    int hm = hist[move_from(quiet_moves[j])][move_to(quiet_moves[j])];
+                    hm -= bonus + hm * bonus / 16000;
+                    hist[move_from(quiet_moves[j])][move_to(quiet_moves[j])] = hm < -16000 ? -16000 : hm;
+                }
             }
             break;
         }
@@ -1483,6 +1546,7 @@ void uci_loop(void) {
     Move m;
 
     init_zobrist();
+    init_lmr();
     parse_fen(STARTPOS);
     hash_key=generate_hash();
 

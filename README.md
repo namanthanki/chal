@@ -1,6 +1,6 @@
 # Chal
 
-**Chal** is a complete, FIDE-rules-compliant chess engine in **827 lines of C99** it has one file, no dependencies, no magic.
+**Chal** is a complete, FIDE-rules-compliant chess engine in **891 lines of C99** it has one file, no dependencies, no magic.
 
 The name is Gujarati for "move." The goal is not to be the strongest engine, but the most readable one. Every subsystem such as move generation, search, evaluation, UCI fits in a single scroll. The source is written to be studied.
 
@@ -44,9 +44,9 @@ There are no abstractions introduced for their own sake. No classes, no polymorp
 - **Iterative deepening** — depth 1, 2, … up to the limit. Each completed depth feeds the next via the TT best-move, making the overhead near zero.
 - **Aspiration windows** — full window at depths 1–3; ±50 cp window from depth 4. Delta doubles on fail-low or fail-high.
 - **Reverse futility pruning** — at depths 1–7, if static eval − 70·depth ≥ β, prune without searching any moves. Zero nodes spent per pruned node.
-- **Null move pruning** — R=2 (R=3 at depth ≥ 6). Guarded against zugzwang: skipped when the side to move has no non-pawn, non-king piece. Guard is O(1) via an incrementally-maintained `non_pawn_count[2]` table. Double null moves prevented by a `was_null` flag.
+- **Null move pruning** — R=3 (R=4 at depth ≥ 7). Guarded against zugzwang: skipped when the side to move has no non-pawn, non-king piece. Guard is O(1) via an incrementally-maintained `non_pawn_count[2]` table. Double null moves prevented by a `was_null` flag.
 - **Principal variation search** — first legal move at each node gets the full window; all later moves are probed with a null window and only re-searched at full depth on a fail-high.
-- **Late move reductions** — quiet moves after the 4th at depth ≥ 3 are searched at depth−2 with a null window; re-searched at depth−1 only if they beat alpha. NMP and LMR skip on PV nodes (`is_pv` flag).
+- **Late move reductions (adaptive LMR)** — a precomputed table gives reduction R = round(ln(depth) × ln(move_number) / 1.6), clamped to [1, 5]. Captures, promotions, and check-giving moves are never reduced. R grows an extra ply on non-PV nodes. Any move whose reduced score beats alpha is re-searched at full depth.
 - **Quiescence search** — fail-soft stand-pat with delta pruning.
 - **Repetition detection** — two-tier: inside the search tree one prior occurrence returns draw immediately (opponent can always force a third); in game history before the root, two prior occurrences required (strict threefold). Bounded by the halfmove clock.
 - **50-move rule** — halfmove clock tracked incrementally in `make_move`, read from FEN field 5; search returns draw score at 100 half-moves.
@@ -58,7 +58,7 @@ There are no abstractions introduced for their own sake. No classes, no polymorp
 3. Queen promotion — 19 999
 4. Killer move slot 0 — 19 998
 5. Killer move slot 1 — 19 997
-6. History heuristic — depth² credit on quiet beta cutoffs, 128×128 from/to table, capped at 19 996 for read (32 000 for write)
+6. History: bonus/malus from beta-cutoff tracking. The cutoff move receives +depth^2 and every quiet move tried before it receives −depth^2 (history malus). Both updates use a formula (diminishing returns) so entries self-correct instead of saturating. Negative scores push failing moves to the bottom of the ordering without ever skipping them.
 
 ### Transposition table
 
@@ -134,8 +134,8 @@ go wtime 60000 btime 60000 movestogo 40
 
 ## Acknowledgements
 
-**Pawel Koziol** ([nescitus](https://github.com/nescitus)) — for thorough testing, bug reports, and architectural guidance throughout the v1.2.1 → v1.3.0 transition.
-His feedback directly produced the killer-move ply-indexing fix, the NMP ply-bookkeeping refactor, the PeSTO evaluation upgrade, the lazy pick-move sort, and the evaluation loop efficiency improvement, etc. 
+**Pawel Koziol** ([nescitus](https://github.com/nescitus)) — for thorough testing, bug reports, and architectural guidance throughout the v1.2.1 → v1.3.1 history.
+His feedback directly shaped the killer-move ply-indexing fix, the NMP ply-bookkeeping refactor, the PeSTO evaluation upgrade, the lazy pick-move sort, and the history malus + formula in v1.3.1.
 
 **Anik Patel** ([Bobingstern](https://github.com/Bobingstern)) — for guiding the SPRT testing setup using [fastchess](https://github.com/Disservin/fastchess), making it possible to measure strength gains objectively across versions.
 

@@ -697,17 +697,18 @@ void parse_fen(const char* fen) {
    rank 7 = rank 8.  CPW tables (rank 8 first) are vertically flipped.
    Black uses (7-rank)*8+file to mirror vertically.
 */
+
 /* mg_pst[piece-1][sq]: middlegame, 16 vals/line = one rank pair, rank 1 first */
 static const int mg_pst[6][64] = {
-  {   0,  0,  0,  0,  0,  0,  0,  0,  -35, -1,-20,-23,-15, 24, 38,-22,  /* pawn   r1-r2 */
-    -26, -4, -4,-10,  3,  3, 33,-12,  -27, -2, -5, 12, 17,  6, 10,-25,  /*        r3-r4 */
-    -14, 13,  6, 21, 23, 12, 17,-23,   -6,  7, 26, 31, 65, 56, 25,-20,  /*        r5-r6 */
-     98,134, 61, 95, 68,126, 34,-11,    0,  0,  0,  0,  0,  0,  0,  0}, /*        r7-r8 */
+  {   0,  0,  0,  0,  0,  0,  0,  0,  -35, -1,-21,-23,-15, 24, 37,-22,  /* pawn   r1-r2 */
+    -26, -4, -4,-10,  3,  3, 32,-12,  -27, -2, -5, 12, 17,  6, 10,-25,  /*        r3-r4 */
+    -14, 13,  6, 21, 23, 12, 17,-23,   -5,  6, 17, 22, 36, 57, 26,-19,  /*        r5-r6 */
+     78, 74, 51, 55, 48, 56, 24, -1,    0,  0,  0,  0,  0,  0,  0,  0}, /*        r7-r8 */
   {-105,-21,-58,-33,-17,-28,-19,-23,  -29,-53,-12, -3, -1, 18,-14,-19,  /* knight r1-r2 */
     -23, -9, 12, 10, 19, 17, 25,-16,  -13,  4, 16, 13, 28, 19, 21, -8,  /*        r3-r4 */
      -9, 17, 19, 53, 37, 69, 18, 22,  -47, 60, 37, 65, 84,129, 73, 44,  /*        r5-r6 */
-    -73,-41, 72, 36, 23, 62,  7,-17, -167,-89,-34,-49, 61,-97,-15,-107},/*        r7-r8 */
-  { -33, -3,-14,-21,-13,-12,-39,-21,    4, 15, 16,  0,  7, 21, 33,  1,  /* bishop r1-r2 */
+    -73,-41, 72, 36, 23, 62,  7,-17, -167,-89,-34,-49, 61,-97,-15,-107}, /*       r7-r8 */
+  { -33, -3,-14,-21,-13,-12,-39,-21,    4, 15, 16,  0,  7, 21, 34,  1,  /* bishop r1-r2 */
       0, 15, 15, 15, 14, 27, 18, 10,   -6, 13, 13, 26, 34, 12, 10,  4,  /*        r3-r4 */
      -4,  5, 19, 50, 37, 37,  7, -2,  -16, 37, 43, 40, 35, 50, 37, -2,  /*        r5-r6 */
     -26, 16,-18,-13, 30, 59, 18,-47,  -29,  4,-82,-37,-25,-42,  7, -8}, /*        r7-r8 */
@@ -725,12 +726,13 @@ static const int mg_pst[6][64] = {
      29, -1,-20, -7, -8, -4,-38,-29,  -65, 23, 16,-15,-56,-34,  2, 13}  /*        r7-r8 */
 };
 
+
 /* eg_pst[piece-1][sq]: endgame, same layout */
 static const int eg_pst[6][64] = {
   {   0,  0,  0,  0,  0,  0,  0,  0,   13,  8,  8, 10, 13,  0,  2, -7,  /* pawn   r1-r2 */
       4,  7, -6,  1,  0, -5, -1, -8,   13,  9, -3, -7, -7, -8,  3, -1,  /*        r3-r4 */
-     32, 24, 13,  5, -2,  4, 17, 17,   94,100, 85, 67, 56, 53, 82, 84,  /*        r5-r6 */
-    178,173,158,134,147,132,165,187,    0,  0,  0,  0,  0,  0,  0,  0}, /*        r7-r8 */
+     32, 24, 13,  5, -2,  4, 17, 17,   73, 69, 45, 27, 26, 33, 52, 64,  /*        r5-r6 */
+     97, 93, 88, 64, 67, 90, 95,126,     0,  0,  0,  0,  0,  0,  0,  0}, /*       r7-r8 */
   { -29,-51,-23,-15,-22,-18,-50,-64,  -42,-20,-10, -5, -2,-20,-23,-44,  /* knight r1-r2 */
     -23, -3, -1, 15, 10, -3,-20,-22,  -18, -6, 16, 25, 16, 17,  4,-18,  /*        r3-r4 */
     -17,  3, 22, 22, 22, 11,  8,-18,  -24,-20, 10,  9, -1, -9,-19,-41,  /*        r5-r6 */
@@ -777,9 +779,15 @@ int evaluate(void) {
     int pseudo_list[32]; /* occupied squares built during first pass (Pawel Koziol) */
     int index = 0, i;
 
+    /* Pawn square lists for passed-pawn detection.
+       At most 8 pawns per side; store 0x88 squares. */
+    int pawn_sq[2][8];
+    int pawn_sq_cnt[2];
+
     mg[WHITE] = mg[BLACK] = eg[WHITE] = eg[BLACK] = phase = 0;
     bishops[WHITE] = bishops[BLACK] = 0;
     memset(pawn_cnt, 0, sizeof(pawn_cnt));
+    pawn_sq_cnt[WHITE] = pawn_sq_cnt[BLACK] = 0;
 
     /* First pass: rank/file double loop visits exactly 64 valid squares
        instead of 128 (Pawel: FOR_EACH_SQ loops the empty half too).
@@ -826,7 +834,11 @@ int evaluate(void) {
                 bishops[color]++;
                 if (bishops[color] == 2) { mg[color] += 30; eg[color] += 30; } /* bishop pair */
             }
-            if (pt == PAWN) pawn_cnt[color][f]++;
+            if (pt == PAWN) {
+                pawn_cnt[color][f]++;
+                if (pawn_sq_cnt[color] < 8)
+                    pawn_sq[color][pawn_sq_cnt[color]++] = sq;
+            }
         }
     }
 
@@ -859,6 +871,71 @@ int evaluate(void) {
         }
     }
 
+    /* PASSED PAWNS
+       A pawn is passed when no enemy pawn on the same or adjacent files
+       is ahead of it. Bonuses are heavily endgame-weighted.
+
+       Three terms:
+       1. Base rank bonus      -- grows exponentially toward promotion
+       2. Own king proximity   -- EG bonus when our king escorts the passer
+       3. Enemy king proximity -- EG penalty when their king blockades it
+       4. Blocker discount     -- halve the bonus if an enemy piece sits
+                                  directly in front (pawn is obstructed)    */
+    static const int pp_eg[8] = { 0, 20, 30, 55, 80, 115, 170, 0 };
+    static const int pp_mg[8] = { 0,  5, 10, 20, 35,  55,  80, 0 };
+
+    for (int color = 0; color < 2; color++) {
+        int enemy = color ^ 1;
+        for (int pi = 0; pi < pawn_sq_cnt[color]; pi++) {
+            int sq = pawn_sq[color][pi];
+            int rank = sq >> 4;
+            int file = sq & 7;
+            int own_rank = (color == WHITE) ? rank : (7 - rank);
+
+            int passed = 1;
+            for (int df = -1; df <= 1 && passed; df++) {
+                int ef = file + df;
+                if (ef < 0 || ef > 7) continue;
+                if (pawn_cnt[enemy][ef] == 0) continue;
+                for (int ei = 0; ei < pawn_sq_cnt[enemy] && passed; ei++) {
+                    int esq = pawn_sq[enemy][ei];
+                    if ((esq & 7) != ef) continue;
+                    int erank = esq >> 4;
+                    if (color == WHITE) { if (erank >= rank) passed = 0; }
+                    else                { if (erank <= rank) passed = 0; }
+                }
+            }
+
+            if (!passed) continue;
+
+            int bonus_mg = pp_mg[own_rank];
+            int bonus_eg = pp_eg[own_rank];
+
+            {
+                int own_ksq   = king_sq[color];
+                int enemy_ksq = king_sq[enemy];
+                int fd_own   = file - (own_ksq  & 7); if (fd_own  < 0) fd_own  = -fd_own;
+                int rd_own   = rank - (own_ksq  >> 4); if (rd_own  < 0) rd_own  = -rd_own;
+                int fd_enemy = file - (enemy_ksq & 7); if (fd_enemy < 0) fd_enemy = -fd_enemy;
+                int rd_enemy = rank - (enemy_ksq >> 4); if (rd_enemy < 0) rd_enemy = -rd_enemy;
+                int dist_own   = fd_own   > rd_own   ? fd_own   : rd_own;
+                int dist_enemy = fd_enemy > rd_enemy ? fd_enemy : rd_enemy;
+                bonus_eg += 4 * (7 - dist_own);
+                bonus_eg -= 4 * (7 - dist_enemy);
+            }
+
+            {
+                int front = sq + (color == WHITE ? 16 : -16);
+                if (!sq_is_off(front) && board[front] && piece_color(board[front]) == enemy) {
+                    bonus_mg /= 2;
+                    bonus_eg /= 2;
+                }
+            }
+
+            mg[color] += bonus_mg;
+            eg[color] += bonus_eg;
+        }
+    }
     /* Rook activity: iterate pseudo_list -- only occupied squares, never
        the 32+ empty squares FOR_EACH_SQ would visit (Pawel Koziol).
        Applied to both MG and EG: an open rook is valuable in all phases. */
@@ -1238,12 +1315,11 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
                R drawn from lmr_table (log-scaled by depth and move number).
                Any move whose reduced score beats alpha is re-searched at full
                depth to get an exact score before updating alpha/best. */
-
-            int is_reduced = 0; // are we doing a reduced search?
+            int is_reduced = 0;
             int gives_check = in_check(side);
-            /* ADAPTIVE LMR: reduction R = lmr_table[depth][move_number],
-               precomputed as round(ln(d)*ln(m)/1.6).  Captures, promotions,
-               and check-giving moves skip reduction entirely.  R is capped so
+            /* ADAPTIVE LMR: R = lmr_table[depth][move_number],
+               precomputed as round(ln(d)*ln(m)/1.6). Captures, promotions,
+               and check-giving moves skip reduction entirely. R is capped so
                we never reduce past depth 1 (i.e. never drop into qsearch). */
             int d_clamped = depth < 32 ? depth : 31;
             int m_clamped = legal < 64 ? legal : 63;
@@ -1390,6 +1466,29 @@ void search_root(int max_depth) {
         if (time_over_flag) break;
 
         prev_score = sc;
+
+        /* PV REPETITION TRUNCATION
+           Walk the PV and truncate at the first move that leads to a position
+           already seen in game history (would be a draw by repetition on the
+           real board). The search scores such lines correctly as 0 internally
+           but the PV table can still carry the moves, causing GUI warnings.  */
+
+        /* Commented because it's just a display issue and this is kept as reference,
+        eats alot of lines of code which is exactly the kind of thing we want to avoid in this codebase.
+
+        {
+            int pv_i;
+            for (pv_i = 0; pv_i < pv_length[0]; pv_i++) {
+                make_move(pv[0][pv_i]);
+                int seen = 0;
+                for (int j = ply - 2; j >= 0 && j >= ply - halfmove_clock; j -= 2)
+                    if (history[j].hash_prev == hash_key) { seen = 1; break; }
+                if (seen) { undo_move(); pv_length[0] = pv_i; break; }
+            }
+            for (int j = pv_i - 1; j >= 0; j--) { (void)j; undo_move(); }
+        } 
+        
+        print_result(sc); */
 
         /* TIME CONTROL: stop iterating if we have used our budget.
            We check AFTER a depth completes, never mid-search, so

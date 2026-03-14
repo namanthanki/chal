@@ -1186,6 +1186,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
        further back than ply - halfmove_clock. We step by 2 because
        repetitions require the same side to move. */
     if (ply > root_ply) {
+        /* Repetition detection */
         for (int i = ply - 2; i >= root_ply; i -= 2)
             if (history[i].hash_prev == hash_key) return 0;
         {
@@ -1193,24 +1194,24 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
             for (int i = ply - 2; i >= 0 && i >= ply - halfmove_clock; i -= 2)
                 if (history[i].hash_prev == hash_key && ++reps >= 2) return 0;
         }
+
+        /* 50-move rule */
+        if (halfmove_clock >= 100) return 0;
+
+        /* INSUFFICIENT MATERIAL
+            Only trigger when there is exactly one minor piece on the board total
+            (KNK or KBK). With one minor per side the corner-checkmate edge case
+            means we cannot safely claim a draw. */
+        {
+            int wminor = count[WHITE][KNIGHT] + count[WHITE][BISHOP];
+            int bminor = count[BLACK][KNIGHT] + count[BLACK][BISHOP];
+            if (wminor + bminor == 1
+                && count[WHITE][PAWN] == 0 && count[BLACK][PAWN] == 0
+                && count[WHITE][ROOK] == 0 && count[BLACK][ROOK] == 0
+                && count[WHITE][QUEEN] == 0 && count[BLACK][QUEEN] == 0)
+                return 0;
+        }
     }
-
-    /* 50-move rule */
-    if (halfmove_clock >= 100) return 0;
-
-    /* INSUFFICIENT MATERIAL
-       KK, KNK, KBK -- no pawns and at most one minor piece per side.
-       KRK and KQK are NOT draws -- rooks and queens can force checkmate.
-       All O(1) via count[color][piece_type].                            */
-    // {
-    //     int wp = count[WHITE][PAWN], bp = count[BLACK][PAWN];
-    //     int wminor = count[WHITE][KNIGHT] + count[WHITE][BISHOP];
-    //     int bminor = count[BLACK][KNIGHT] + count[BLACK][BISHOP];
-    //     int wmajor = count[WHITE][ROOK] + count[WHITE][QUEEN];
-    //     int bmajor = count[BLACK][ROOK] + count[BLACK][QUEEN];
-    //     if (!wp && !bp && !wmajor && !bmajor && wminor <= 1 && bminor <= 1)
-    //         return 0;
-    // }
 
     /* TT probe: always extract hash_move for ordering */
     if (e->key == hash_key) {

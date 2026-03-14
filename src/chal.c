@@ -700,65 +700,65 @@ void parse_fen(const char* fen) {
 
 /* mg_pst[piece-1][sq]: middlegame, 16 vals/line = one rank pair, rank 1 first */
 static const int mg_pst[6][64] = {
-  {   0,  0,  0,  0,  0,  0,  0,  0,  -35, -1,-21,-23,-15, 24, 37,-22,  /* pawn   r1-r2 */
-    -26, -4, -4,-10,  3,  3, 32,-12,  -27, -2, -5, 12, 17,  6, 10,-25,  /*        r3-r4 */
-    -14, 13,  6, 21, 23, 12, 17,-23,   -5,  6, 17, 22, 36, 57, 26,-19,  /*        r5-r6 */
-     78, 74, 51, 55, 48, 56, 24, -1,    0,  0,  0,  0,  0,  0,  0,  0}, /*        r7-r8 */
-  {-105,-21,-58,-33,-17,-28,-19,-23,  -29,-53,-12, -3, -1, 18,-14,-19,  /* knight r1-r2 */
-    -23, -9, 12, 10, 19, 17, 25,-16,  -13,  4, 16, 13, 28, 19, 21, -8,  /*        r3-r4 */
-     -9, 17, 19, 53, 37, 69, 18, 22,  -47, 60, 37, 65, 84,129, 73, 44,  /*        r5-r6 */
-    -73,-41, 72, 36, 23, 62,  7,-17, -167,-89,-34,-49, 61,-97,-15,-107}, /*       r7-r8 */
-  { -33, -3,-14,-21,-13,-12,-39,-21,    4, 15, 16,  0,  7, 21, 34,  1,  /* bishop r1-r2 */
-      0, 15, 15, 15, 14, 27, 18, 10,   -6, 13, 13, 26, 34, 12, 10,  4,  /*        r3-r4 */
-     -4,  5, 19, 50, 37, 37,  7, -2,  -16, 37, 43, 40, 35, 50, 37, -2,  /*        r5-r6 */
-    -26, 16,-18,-13, 30, 59, 18,-47,  -29,  4,-82,-37,-25,-42,  7, -8}, /*        r7-r8 */
-  { -19,-13,  1, 17, 16,  7,-37,-26,  -44,-16,-20, -9, -1, 11, -6,-71,  /* rook   r1-r2 */
-    -45,-25,-16,-17,  3,  0, -5,-33,  -36,-26,-12, -1,  9, -7,  6,-23,  /*        r3-r4 */
-    -24,-11,  7, 26, 24, 35, -8,-20,   -5, 19, 26, 36, 17, 45, 61, 16,  /*        r5-r6 */
-     27, 32, 58, 62, 80, 67, 26, 44,   32, 42, 32, 51, 63,  9, 31, 43}, /*        r7-r8 */
-  {  -1,-18, -9, 10,-15,-25,-31,-50,  -35, -8, 11,  2,  8, 15, -3,  1,  /* queen  r1-r2 */
-    -14,  2,-11, -2, -5,  2, 14,  5,   -9,-26, -9,-10, -2, -4,  3, -3,  /*        r3-r4 */
-    -27,-27,-16,-16, -1, 17, -2,  1,  -13,-17,  7,  8, 29, 56, 47, 57,  /*        r5-r6 */
-    -24,-39, -5,  1,-16, 57, 28, 54,  -28,  0, 29, 12, 59, 44, 43, 45}, /*        r7-r8 */
-  { -15, 36, 12,-54,  8,-28, 24, 14,    1,  7, -8,-64,-43,-16,  9,  8,  /* king   r1-r2 */
-    -14,-14,-22,-46,-44,-30,-15,-27,  -49, -1,-27,-39,-46,-44,-33,-51,  /*        r3-r4 */
-    -17,-20,-12,-27,-30,-25,-14,-36,   -9, 24,  2,-16,-20,  6, 22,-22,  /*        r5-r6 */
-     29, -1,-20, -7, -8, -4,-38,-29,  -65, 23, 16,-15,-56,-34,  2, 13}  /*        r7-r8 */
+  {   0,  0,  0,  0,  0,  0,  0,  0,  -35, -6,-25,-22,-15, 18, 25,-26,  /* pawn   r1-r2 */
+    -26,-11, -4, -8,  5,  5, 22,-12,  -29, -5, -4, 14, 17,  6,  8,-27,  /*        r3-r4 */
+    -16, 12,  8, 23, 25, 14, 18,-25,   -6,  8, 19, 23, 38, 59, 26,-19,  /*        r5-r6 */
+     80, 76, 49, 54, 50, 57, 26, -3,    0,  0,  0,  0,  0,  0,  0,  0}, /*        r7-r8 */
+  {-106,-19,-56,-31,-15,-26,-20,-22,  -27,-51,-10, -1,  1, 20,-12,-17,  /* knight r1-r2 */
+    -25, -7, 10, 12, 21, 19, 27,-18,  -12,  6, 16, 12, 30, 20, 23, -7,  /*        r3-r4 */
+     -7, 18, 18, 55, 35, 70, 17, 23,  -47, 61, 37, 63, 85,128, 74, 42,  /*        r5-r6 */
+    -71,-40, 74, 37, 23, 64,  5,-15, -165,-87,-32,-47, 63,-96,-15,-105}, /*       r7-r8 */
+  { -32, -1,-12,-19,-11,-14,-39,-21,    5, 19, 17,  0,  9, 23, 36,  2,  /* bishop r1-r2 */
+     -2, 17, 15, 13, 12, 28, 19,  8,   -4, 15, 11, 27, 33, 10,  9,  5,  /*        r3-r4 */
+     -3,  3, 19, 52, 35, 35,  5, -3,  -18, 38, 43, 38, 35, 52, 37, -4,  /*        r5-r6 */
+    -26, 17,-17,-12, 32, 60, 20,-47,  -27,  5,-82,-36,-23,-40,  8, -7}, /*        r7-r8 */
+  { -17,-11,  2, 15, 14,  9,-39,-25,  -43,-15,-18,-10, -1, 13, -4,-72,  /* rook   r1-r2 */
+    -44,-23,-16,-17,  1,  2, -3,-34,  -38,-24,-13, -3,  9, -6,  6,-25,  /*        r3-r4 */
+    -22,-10,  5, 25, 22, 35, -8,-20,   -6, 19, 24, 34, 15, 46, 61, 16,  /*        r5-r6 */
+     25, 30, 56, 60, 78, 65, 24, 42,   33, 42, 31, 49, 62, 11, 33, 45}, /*        r7-r8 */
+  {  -2,-17, -7, 12,-13,-23,-29,-49,  -34, -9, 11,  4, 10, 17, -1,  3,  /* queen  r1-r2 */
+    -16,  0,-13, -4, -7,  0, 13,  5,  -11,-28,-11,-12, -4, -6,  1, -5,  /*        r3-r4 */
+    -29,-29,-18,-18, -3, 15, -3, -1,  -11,-19,  5,  6, 29, 58, 47, 57,  /*        r5-r6 */
+    -23,-41, -5,  3,-17, 59, 29, 56,  -26,  1, 31, 13, 61, 46, 45, 47}, /*        r7-r8 */
+  { -17, 36, 14,-56,  6,-26, 26, 12,    1,  8, -6,-66,-45,-14, 11,  7,  /* king   r1-r2 */
+    -13,-12,-20,-48,-46,-28,-13,-25,  -48,  1,-25,-41,-48,-42,-32,-53,  /*        r3-r4 */
+    -16,-18,-10,-29,-31,-25,-13,-35,   -7, 26,  4,-17,-22,  8, 24,-24,  /*        r5-r6 */
+     30,  1,-18, -5,-10, -2,-36,-28,  -66, 24, 18,-14,-58,-32,  3, 13}  /*        r7-r8 */
 };
 
 
 /* eg_pst[piece-1][sq]: endgame, same layout */
 static const int eg_pst[6][64] = {
-  {   0,  0,  0,  0,  0,  0,  0,  0,   13,  8,  8, 10, 13,  0,  2, -7,  /* pawn   r1-r2 */
-      4,  7, -6,  1,  0, -5, -1, -8,   13,  9, -3, -7, -7, -8,  3, -1,  /*        r3-r4 */
-     32, 24, 13,  5, -2,  4, 17, 17,   73, 69, 45, 27, 26, 33, 52, 64,  /*        r5-r6 */
-     97, 93, 88, 64, 67, 90, 95,126,     0,  0,  0,  0,  0,  0,  0,  0}, /*       r7-r8 */
-  { -29,-51,-23,-15,-22,-18,-50,-64,  -42,-20,-10, -5, -2,-20,-23,-44,  /* knight r1-r2 */
-    -23, -3, -1, 15, 10, -3,-20,-22,  -18, -6, 16, 25, 16, 17,  4,-18,  /*        r3-r4 */
-    -17,  3, 22, 22, 22, 11,  8,-18,  -24,-20, 10,  9, -1, -9,-19,-41,  /*        r5-r6 */
-    -25, -8,-25, -2, -9,-25,-24,-52,  -58,-38,-13,-28,-31,-27,-63,-99}, /*        r7-r8 */
-  { -23, -9,-23, -5, -9,-16, -5,-17,  -14,-18, -7, -1,  4, -9,-15,-27,  /* bishop r1-r2 */
-    -12, -3,  8, 10, 13,  3, -7,-15,   -6,  3, 13, 19,  7, 10, -3, -9,  /*        r3-r4 */
-     -3,  9, 12,  9, 14, 10,  3,  2,    2, -8,  0, -1, -2,  6,  0,  4,  /*        r5-r6 */
-     -8, -4,  7,-12, -3,-13, -4,-14,  -14,-21,-11, -8, -7, -9,-17,-24}, /*        r7-r8 */
-  {  -9,  2,  3, -1, -5,-13,  4,-20,   -6, -6,  0,  2, -9, -9,-11, -3,  /* rook   r1-r2 */
-     -4,  0, -5, -1, -7,-12, -8,-16,    3,  5,  8,  4, -5, -6, -8,-11,  /*        r3-r4 */
-      4,  3, 13,  1,  2,  1, -1,  2,    7,  7,  7,  5,  4, -3, -5, -3,  /*        r5-r6 */
-     11, 13, 13, 11, -3,  3,  8,  3,   13, 10, 18, 15, 12, 12,  8,  5}, /*        r7-r8 */
-  { -33,-28,-22,-43, -5,-32,-20,-41,  -22,-23,-30,-16,-16,-23,-36,-32,  /* queen  r1-r2 */
-    -16,-27, 15,  6,  9, 17, 10,  5,  -18, 28, 19, 47, 31, 34, 39, 23,  /*        r3-r4 */
-      3, 22, 24, 45, 57, 40, 57, 36,  -20,  6,  9, 49, 47, 35, 19,  9,  /*        r5-r6 */
-    -17, 20, 32, 41, 58, 25, 30,  0,   -9, 22, 22, 27, 27, 19, 10, 20}, /*        r7-r8 */
-  { -53,-34,-21,-11,-28,-14,-24,-43,  -27,-11,  4, 13, 14,  4, -5,-17,  /* king   r1-r2 */
-    -19, -3, 11, 21, 23, 16,  7, -9,  -18, -4, 21, 24, 27, 23,  9,-11,  /*        r3-r4 */
-     -8, 22, 24, 27, 26, 33, 26,  3,   10, 17, 23, 15, 20, 45, 44, 13,  /*        r5-r6 */
-    -12, 17, 14, 17, 17, 38, 23, 11,  -74,-35,-18,-18,-11, 15,  4,-17}  /*        r7-r8 */
+  {   0,  0,  0,  0,  0,  0,  0,  0,   14,  6,  8,  8, 12, -2,  0, -9,  /* pawn   r1-r2 */
+      2,  5, -8,  0,  0, -5, -3,-10,   11,  7, -5, -9, -9,-10,  1, -3,  /*        r3-r4 */
+     30, 22, 11,  3, -4,  2, 15, 15,   72, 69, 46, 25, 24, 31, 52, 62,  /*        r5-r6 */
+     95, 92, 86, 62, 65, 88, 93,124,    0,  0,  0,  0,  0,  0,  0,  0}, /*        r7-r8 */
+  { -27,-49,-21,-13,-20,-16,-48,-62,  -40,-18, -8, -3,  0,-18,-21,-42,  /* knight r1-r2 */
+    -21, -2, -1, 16, 12, -2,-18,-20,  -16, -4, 18, 27, 17, 17,  6,-16,  /*        r3-r4 */
+    -15,  5, 24, 24, 24, 12, 10,-20,  -22,-18,  9, 10, -3,-11,-19,-42,  /*        r5-r6 */
+    -23, -6,-24,  0, -9,-27,-26,-50,  -56,-36,-11,-26,-30,-25,-61,-98}, /*        r7-r8 */
+  { -21, -7,-21, -3, -7,-14, -3,-15,  -12,-16, -5,  1,  5, -7,-13,-26,  /* bishop r1-r2 */
+    -10, -1, 10, 10, 15,  2, -5,-13,   -4,  4, 14, 20,  7,  9, -2, -7,  /*        r3-r4 */
+     -1, 11, 13,  9, 14,  8,  4,  4,    4, -7,  0,  0,  0,  6,  2,  6,  /*        r5-r6 */
+     -6, -2,  9,-10, -2,-11, -4,-12,  -12,-19, -9, -6, -5, -7,-15,-22}, /*        r7-r8 */
+  {  -7,  4,  5, -1, -3,-11,  6,-18,   -4, -4,  2,  4, -7, -7, -9, -1,  /* rook   r1-r2 */
+     -2,  2, -3,  1, -5,-10, -6,-14,    5,  7, 10,  3, -4, -4, -6, -9,  /*        r3-r4 */
+      6,  5, 15,  0,  0,  3,  0,  4,    9,  9,  7,  4,  4, -1, -3, -1,  /*        r5-r6 */
+      9, 11, 11,  9, -5,  1,  6,  1,   15, 11, 20, 13, 12, 14, 10,  7}, /*        r7-r8 */
+  { -33,-27,-21,-41, -3,-31,-18,-40,  -20,-21,-28,-15,-15,-21,-34,-31,  /* queen  r1-r2 */
+    -14,-26, 15,  7, 10, 18, 12,  7,  -17, 30, 19, 48, 30, 36, 39, 25,  /*        r3-r4 */
+      4, 23, 23, 46, 59, 40, 59, 38,  -19,  6,  9, 50, 49, 37, 19, 11,  /*        r5-r6 */
+    -16, 22, 33, 43, 60, 27, 32,  1,   -7, 24, 23, 29, 29, 21, 12, 22}, /*        r7-r8 */
+  { -55,-36,-19,-12,-30,-12,-26,-45,  -28, -9,  6, 11, 12,  6, -3,-19,  /* king   r1-r2 */
+    -21, -1, 13, 19, 21, 18,  9,-10,  -19, -3, 23, 22, 25, 25, 11,-12,  /*        r3-r4 */
+    -10, 24, 26, 25, 24, 35, 28,  1,   10, 18, 24, 13, 18, 46, 45, 11,  /*        r5-r6 */
+    -12, 19, 16, 16, 15, 40, 25, 12,  -74,-34,-18,-20,-13, 17,  5,-19}  /*        r7-r8 */
 };
 
 /* Separate MG/EG material values (Rofchade).
    piece_val[] is kept unchanged for MVV-LVA move ordering. */
 static const int mg_val[6] = { 82, 337, 365, 477, 1025,    0 };
-static const int eg_val[6] = { 94, 281, 297, 512,  936,    0 };
+static const int eg_val[6] = { 94, 281, 297, 513,  937,    0 };
 
 /* Phase contribution per piece type (indexed by TYPE(): 1=pawn..6=king).
    knight=1, bishop=1, rook=2, queen=4; max total = 24. */
@@ -771,11 +771,14 @@ static const int piece_val[7] = { 0,100,320,330,500,900,20000 };
    inactive pieces are penalised rather than all pieces getting a flat bonus.
    Indexed by TYPE(): 0=empty,1=pawn,2=knight,3=bishop,4=rook,5=queen,6=king */
 static const int mob_center[7] = { 0, 0, 4, 6, 6, 13, 0 };
+static const int mob_step_mg[7] = { 0, 0, 3, 4, 3, 2, 0 };
+static const int mob_step_eg[7] = { 0, 0, 3, 4, 4, 2, 0 };
 
 int evaluate(void) {
     int mg[2], eg[2], phase;
     int bishops[2];
     int pawn_cnt[2][8];
+    int lowest_pawn_rank[2][8];
     int pseudo_list[32]; /* occupied squares built during first pass (Pawel Koziol) */
     int index = 0, i;
 
@@ -788,6 +791,10 @@ int evaluate(void) {
     bishops[WHITE] = bishops[BLACK] = 0;
     memset(pawn_cnt, 0, sizeof(pawn_cnt));
     pawn_sq_cnt[WHITE] = pawn_sq_cnt[BLACK] = 0;
+    for (int i = 0; i < 8; i++) {
+        lowest_pawn_rank[WHITE][i] = 7;
+        lowest_pawn_rank[BLACK][i] = 7;
+    }
 
     /* First pass: rank/file double loop visits exactly 64 valid squares
        instead of 128 (Pawel: FOR_EACH_SQ loops the empty half too).
@@ -799,6 +806,13 @@ int evaluate(void) {
             int p = board[sq]; if (!p) continue;
             pseudo_list[index++] = sq;                    /* memorize (Pawel) */
             int pt = piece_type(p), color = piece_color(p);
+
+            /* Set loweest rank on which there is a pawn */
+            if (pt == PAWN) {
+                int own_rank = (color == WHITE) ? rank : (7 - rank);
+                if (own_rank < lowest_pawn_rank[color][f])
+                    lowest_pawn_rank[color][f] = own_rank;
+            }
 
             /* Square index: rank 0 = White's back rank.
                Black mirrors vertically so its rank 0 is rank 7 in White terms. */
@@ -826,13 +840,13 @@ int evaluate(void) {
                     }
                 }
                 mob -= mob_center[pt];
-                mg[color] += (pt == QUEEN ? 2 : 3) * mob;
-                eg[color] += (pt == QUEEN ? 2 : 3) * mob;
+                mg[color] += mob_step_mg[pt] * mob;
+                eg[color] += mob_step_eg[pt] * mob;
             }
 
             if (pt == BISHOP) {
                 bishops[color]++;
-                if (bishops[color] == 2) { mg[color] += 30; eg[color] += 30; } /* bishop pair */
+                if (bishops[color] == 2) { mg[color] += 31; eg[color] += 30; } /* bishop pair */
             }
             if (pt == PAWN) {
                 pawn_cnt[color][f]++;
@@ -856,17 +870,21 @@ int evaluate(void) {
         /* King pawn shield -- MG only.
            In the endgame, king centralisation is already rewarded by the
            EG king PST; a pawn shield is irrelevant and would only hurt. */
+
+        static const int shield_val[8] = { 0, 12, 4, -2, -2, 0, 0, -12 };
+
         {
             int ksq = king_sq[color], kf = ksq & 7;
             if (kf <= 2 || kf >= 5) {
-                int penalty = 0;
+                int shield = 0;
                 for (int f_test = kf - 1; f_test <= kf + 1; f_test++) {
-                    if (f_test >= 0 && f_test <= 7 && pawn_cnt[color][f_test] == 0) {
-                        penalty += 15;
-                        penalty += (pawn_cnt[color ^ 1][f_test] == 0) ? 25 : 10;
+                    if (f_test >= 0 && f_test <= 7) {
+                        shield += shield_val[lowest_pawn_rank[color][f_test]];
+                        if (lowest_pawn_rank[color][f_test] == 7)
+                            shield -= 18 * (lowest_pawn_rank[color ^ 1][f_test] == 7);
                     }
                 }
-                mg[color] -= penalty;
+                mg[color] += shield;
             }
         }
     }
@@ -902,7 +920,7 @@ int evaluate(void) {
                     if ((esq & 7) != ef) continue;
                     int erank = esq >> 4;
                     if (color == WHITE) { if (erank >= rank) passed = 0; }
-                    else                { if (erank <= rank) passed = 0; }
+                    else { if (erank <= rank) passed = 0; }
                 }
             }
 
@@ -912,13 +930,13 @@ int evaluate(void) {
             int bonus_eg = pp_eg[own_rank];
 
             {
-                int own_ksq   = king_sq[color];
+                int own_ksq = king_sq[color];
                 int enemy_ksq = king_sq[enemy];
-                int fd_own   = file - (own_ksq  & 7); if (fd_own  < 0) fd_own  = -fd_own;
-                int rd_own   = rank - (own_ksq  >> 4); if (rd_own  < 0) rd_own  = -rd_own;
+                int fd_own = file - (own_ksq & 7); if (fd_own < 0) fd_own = -fd_own;
+                int rd_own = rank - (own_ksq >> 4); if (rd_own < 0) rd_own = -rd_own;
                 int fd_enemy = file - (enemy_ksq & 7); if (fd_enemy < 0) fd_enemy = -fd_enemy;
                 int rd_enemy = rank - (enemy_ksq >> 4); if (rd_enemy < 0) rd_enemy = -rd_enemy;
-                int dist_own   = fd_own   > rd_own   ? fd_own   : rd_own;
+                int dist_own = fd_own > rd_own ? fd_own : rd_own;
                 int dist_enemy = fd_enemy > rd_enemy ? fd_enemy : rd_enemy;
                 bonus_eg += 4 * (7 - dist_own);
                 bonus_eg -= 4 * (7 - dist_enemy);
@@ -946,8 +964,7 @@ int evaluate(void) {
             int rank = sq >> 4, bonus = 0;
             if (pawn_cnt[color][f] == 0)
                 bonus += (pawn_cnt[color ^ 1][f] == 0) ? 20 : 10; /* open/semi-open file */
-            if ((color == WHITE && rank == 6) || (color == BLACK && rank == 1))
-                bonus += 20; /* 7th rank */
+            // no rook on 7th eval, piece/square tables will take care of that
             mg[color] += bonus; eg[color] += bonus;
         }
     }
@@ -1273,9 +1290,6 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
 
     for (int i = 0; i < cnt; i++) {
         pick_move(moves, scores, cnt, i);
-        /* DELTA PRUNING (Quiescence only)
-           If capturing this piece plus a safety margin can't possibly
-           raise alpha, skip generating the recursive tree. */
         {
             /* DELTA PRUNING (Quiescence only)
                If capturing this piece plus a safety margin can't possibly
@@ -1450,17 +1464,17 @@ void search_root(int max_depth) {
     best_root_move = 0;
     t_start = clock();
 
+    /* Init search */
     memset(hist, 0, sizeof(hist));
     memset(killers, 0, sizeof(killers));
+    memset(pv, 0, sizeof(pv));
+    memset(pv_length, 0, sizeof(pv_length));
+    nodes_searched = 0;
 
     root_ply = ply;   /* anchor sply=0 at the search root */
 
     for (root_depth = 1; root_depth <= max_depth; root_depth++) {
         int alpha = -INF, beta = INF;
-
-        nodes_searched = 0;
-        memset(pv, 0, sizeof(pv));
-        memset(pv_length, 0, sizeof(pv_length));
 
         /* Use a fixed aspiration window around the previous iteration's
            score from depth 5 onward. */
@@ -1472,12 +1486,8 @@ void search_root(int max_depth) {
         sc = search(root_depth, alpha, beta, 0, 0);
 
         /* If the narrow window failed low/high, redo once with a full window. */
-        if (!time_over_flag && root_depth >= 5 && (sc <= alpha || sc >= beta)) {
-            nodes_searched = 0;
-            memset(pv, 0, sizeof(pv));
-            memset(pv_length, 0, sizeof(pv_length));
+        if (!time_over_flag && root_depth >= 5 && (sc <= alpha || sc >= beta))
             sc = search(root_depth, -INF, INF, 0, 0);
-        }
 
         if (time_over_flag) break;
 
@@ -1489,26 +1499,26 @@ void search_root(int max_depth) {
            real board). The search scores such lines correctly as 0 internally
            but the PV table can still carry the moves, causing GUI warnings.  */
 
-        /* Commented because it's just a display issue and this is kept as reference,
-        eats alot of lines of code which is exactly the kind of thing we want to avoid in this codebase.
+           /* Commented because it's just a display issue and this is kept as reference,
+           eats alot of lines of code which is exactly the kind of thing we want to avoid in this codebase.
 
-        {
-            int pv_i;
-            for (pv_i = 0; pv_i < pv_length[0]; pv_i++) {
-                make_move(pv[0][pv_i]);
-                int seen = 0;
-                for (int j = ply - 2; j >= 0 && j >= ply - halfmove_clock; j -= 2)
-                    if (history[j].hash_prev == hash_key) { seen = 1; break; }
-                if (seen) { undo_move(); pv_length[0] = pv_i; break; }
-            }
-            for (int j = pv_i - 1; j >= 0; j--) { (void)j; undo_move(); }
-        } 
-        
-        print_result(sc); */
+           {
+               int pv_i;
+               for (pv_i = 0; pv_i < pv_length[0]; pv_i++) {
+                   make_move(pv[0][pv_i]);
+                   int seen = 0;
+                   for (int j = ply - 2; j >= 0 && j >= ply - halfmove_clock; j -= 2)
+                       if (history[j].hash_prev == hash_key) { seen = 1; break; }
+                   if (seen) { undo_move(); pv_length[0] = pv_i; break; }
+               }
+               for (int j = pv_i - 1; j >= 0; j--) { (void)j; undo_move(); }
+           }
 
-        /* TIME CONTROL: stop iterating if we have used our budget.
-           We check AFTER a depth completes, never mid-search, so
-           the move we return is always from a fully searched depth. */
+           print_result(sc); */
+
+           /* TIME CONTROL: stop iterating if we have used our budget.
+              We check AFTER a depth completes, never mid-search, so
+              the move we return is always from a fully searched depth. */
         {
             int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
             if (time_budget_ms > 0 && ms >= time_budget_ms / 2) break;
@@ -1735,4 +1745,4 @@ int main(void) {
     setbuf(stdout, NULL);
     uci_loop();
     return 0;
-}
+} 

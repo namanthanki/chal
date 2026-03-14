@@ -1276,9 +1276,19 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         /* DELTA PRUNING (Quiescence only)
            If capturing this piece plus a safety margin can't possibly
            raise alpha, skip generating the recursive tree. */
-        if (caps_only && board[move_to(moves[i])]) {
-            int cap_val = piece_val[piece_type(board[move_to(moves[i])])];
-            if (best_sc + cap_val + 200 < alpha) continue;
+        {
+            /* DELTA PRUNING (Quiescence only)
+               If capturing this piece plus a safety margin can't possibly
+               raise alpha, skip generating the recursive tree.
+               En-passant lands on an empty square so check ep_square too. */
+            int dp_cap = board[move_to(moves[i])];
+            int dp_ep  = (!dp_cap
+                          && piece_type(board[move_from(moves[i])]) == PAWN
+                          && move_to(moves[i]) == ep_square);
+            if (caps_only && (dp_cap || dp_ep)) {
+                int cap_val = dp_cap ? piece_val[piece_type(dp_cap)] : piece_val[PAWN];
+                if (best_sc + cap_val + 200 < alpha) continue;
+            }
         }
 
         /* Capture flag must be read before make_move: after the call
@@ -1290,7 +1300,7 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         make_move(moves[i]);
         if (is_illegal()) { undo_move(); continue; }
         legal++;
-        if (!is_cap) { quiet++; if (nquiet < 256) quiet_moves[nquiet++] = moves[i]; }
+        if (!is_cap) quiet++;
 
         /* LATE MOVE PRUNING (LMP)
            At shallow depths, skip quiet moves beyond the first few.
@@ -1300,6 +1310,15 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         if (!caps_only && !is_pv && depth < 4 && quiet > 4 * depth + 1) {
             if (!in_check(side)) { undo_move(); continue; }
         }
+        /* Push to quiet list only after LMP: only actually-searched quiets
+           should receive a history malus on beta cutoff. */
+        if (!is_cap) { quiet_moves[nquiet++] = moves[i]; }
+
+        /* CHECK EXTENSION: if the move gives check, extend by 1 ply.
+           This ensures the engine never horizon-drops into QS while
+           the opponent is in check -- the resolution is searched fully.
+           Guard: only in main search (depth > 0), not inside QS. */
+        int ext = (!caps_only && in_check(side)) ? 1 : 0;
 
         /* PRINCIPAL VARIATION SEARCH + LMR
            First legal move searched with full window to establish the PV.
@@ -1309,21 +1328,18 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
            in modern PVS the re-search will simply fail-high and that score
            is still valid (it is >= beta, which the parent will cut off anyway). */
         if (caps_only || legal == 1) {
-            sc = -search(depth - 1, -beta, -alpha, 0, sply + 1);
+            sc = -search(depth - 1 + ext, -beta, -alpha, 0, sply + 1);
         } else {
             /* Adaptive LMR: late quiet moves are searched at a reduced depth
                R drawn from lmr_table (log-scaled by depth and move number).
                Any move whose reduced score beats alpha is re-searched at full
                depth to get an exact score before updating alpha/best. */
             int is_reduced = 0;
-            int gives_check = in_check(side);
-            /* ADAPTIVE LMR: R = lmr_table[depth][move_number],
-               precomputed as round(ln(d)*ln(m)/1.6). Captures, promotions,
-               and check-giving moves skip reduction entirely. R is capped so
-               we never reduce past depth 1 (i.e. never drop into qsearch). */
+            /* ext != 0 iff the move gives check -- reuse it to skip LMR
+               on checking moves without a second in_check() call. */
             int d_clamped = depth < 32 ? depth : 31;
             int m_clamped = legal < 64 ? legal : 63;
-            int lmr = (!is_cap && !move_promo(moves[i]) && !gives_check)
+            int lmr = (!is_cap && !move_promo(moves[i]) && !ext)
                 ? lmr_table[d_clamped][m_clamped] : 0;
 
             // Increase reduction in non-PV nodes (they're expected to fail low anyway)
@@ -1335,16 +1351,16 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
 
             if (lmr > 0) {
                 // reduced depth + null window
-                sc = -search(depth - 1 - lmr, -alpha - 1, -alpha, 0, sply + 1);
+                sc = -search(depth - 1 + ext - lmr, -alpha - 1, -alpha, 0, sply + 1);
                 if (sc <= alpha) is_reduced = 1; // failed low, skip re-search
             }
 
             if (!is_reduced) {
                 // full depth + full window
-                sc = -search(depth - 1, -alpha - 1, -alpha, 0, sply + 1);
+                sc = -search(depth - 1 + ext, -alpha - 1, -alpha, 0, sply + 1);
                 if (sc > alpha && is_pv) {
                     // full window only on PV nodes
-                    sc = -search(depth - 1, -beta, -alpha, 0, sply + 1);
+                    sc = -search(depth - 1 + ext, -beta, -alpha, 0, sply + 1);
                 }
             }
         }
@@ -1589,7 +1605,12 @@ void uci_loop(void) {
     }
 
     while (fgets(line, sizeof(line), stdin)) {
-        if (!strncmp(line, "uci", 3)) {
+        if (!strncmp(line, "ucinewgame", 10)) {
+            memset(tt, 0, (size_t)tt_size * sizeof(TTEntry)); memset(hist, 0, sizeof(hist));
+            parse_fen(STARTPOS);
+            hash_key = generate_hash();
+        }
+        else if (!strncmp(line, "uci", 3)) {
             printf("id name Chal root\nid author Naman Thanki\n");
             printf("option name Hash type spin default 16 min 1 max 4096\n");
             printf("uciok\n");
@@ -1614,11 +1635,6 @@ void uci_loop(void) {
         }
         else if (!strncmp(line, "isready", 7)) {
             printf("readyok\n"); fflush(stdout);
-        }
-        else if (!strncmp(line, "ucinewgame", 10)) {
-            memset(tt, 0, (size_t)tt_size * sizeof(TTEntry)); memset(hist, 0, sizeof(hist));
-            parse_fen(STARTPOS);
-            hash_key = generate_hash();
         }
         else if (!strncmp(line, "perft", 5)) {
             int depth = 4; int64_t n;

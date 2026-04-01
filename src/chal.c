@@ -26,7 +26,7 @@
    S8  FEN Parser                - reading position strings
    S9  Evaluation                - material, geometry, and structure
    S10 Move Ordering             - MVV-LVA, killers, and history
-   S11 Search                    - negamax, alpha-beta, quiescence
+   S11 Search                    - qsearch, negamax alpha-beta, PVS
    S12 Perft                     - correctness testing
    S13 UCI Loop                  - GUI communication
 
@@ -89,6 +89,11 @@ static inline int piece_type(int p) { return p & 7; }
 static inline int piece_color(int p) { return p >> 3; }
 static inline int make_piece(int c, int t) { return (c << 3) | t; }
 enum { INF = 50000, MATE = 30000 };
+const int WP = 1, BP = 9;
+
+// globals for see
+short see_cleared[128];
+short see_sentinel = 1;
 
 /* ---------------------------------------------------------------
    MOVE ENCODING
@@ -138,21 +143,13 @@ static inline Move make_move_enc(int fr, int to, int p) { return fr | (to << 7) 
 */
 
 enum { TT_EXACT = 0, TT_ALPHA = 1, TT_BETA = 2 };
-
-/* 64-bit Zobrist key type -- halves collision rate vs 32-bit */
-typedef uint64_t HASH;
-
-typedef struct {
-    HASH key; int score; Move best_move; unsigned int depth_flag;
-} TTEntry;
-
-/* TT size is configurable via UCI setoption name Hash (default 16 MB). */
+typedef uint64_t HASH;  /* 64-bit Zobrist key -- halves collision rate vs 32-bit */
+typedef struct { HASH key; int score; Move best_move; unsigned int depth_flag; } TTEntry;
 TTEntry* tt = NULL;
-int64_t tt_size = 1 << 20; /* default 1M entries = 16 MB */
-
-static inline unsigned int tt_depth(const TTEntry* e) { return e->depth_flag >> 2; }          /* bits 7..2 */
-static inline unsigned int tt_flag(const TTEntry* e) { return e->depth_flag & 3; }            /* bits 1..0 */
-static inline unsigned int tt_pack(int d, int f) { return (unsigned int)((d << 2) | f); } /* write both */
+int64_t tt_size = 1 << 20;                                          /* default 1M entries = 16 MB */
+static inline unsigned int tt_depth(const TTEntry* e) { return e->depth_flag >> 2; }  /* bits 7..2 */
+static inline unsigned int tt_flag(const TTEntry* e)  { return e->depth_flag & 3; }   /* bits 1..0 */
+static inline unsigned int tt_pack(int d, int f)      { return (unsigned int)((d << 2) | f); }
 
 /* ---------------------------------------------------------------
    UNDO HISTORY & KILLERS
@@ -170,7 +167,7 @@ static inline unsigned int tt_pack(int d, int f) { return (unsigned int)((d << 2
 */
 
 typedef struct {
-    Move move; int piece_captured; int capt_slot;  int ep_square_prev; unsigned int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev;
+    Move move; int piece_captured; int capt_slot;  int ep_square_prev; unsigned int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev; int in_check;
 } State;
 
 State history[1024];
@@ -210,6 +207,12 @@ int  pv_length[MAX_PLY];
    Reset at the start of each search_root call.                          */
 int hist[128][128];
 
+/* LMR REDUCTION TABLE
+   lmr_table[depth][move_number] = reduction R, precomputed from
+   R = round(ln(depth) * ln(move_number) / 1.6), clamped to [1,5].
+   Captures, promotions, and check-giving moves bypass LMR entirely. */
+int lmr_table[32][64];
+
 /* TIME MANAGEMENT GLOBALS */
 clock_t t_start;
 int time_over_flag = 0;
@@ -237,20 +240,12 @@ int time_over_flag = 0;
 
 static inline int sq_is_off(int sq) { return sq & 0x88; }
 #define FOR_EACH_SQ(sq) for(sq=0; sq<128; sq++) if(sq_is_off(sq)) sq+=7; else
-
-int board[128];
-int side, xside;
-int ep_square;
+int board[128], side, xside, ep_square, ply, halfmove_clock;
 unsigned int castle_rights;    /* bits: 1=WO-O  2=WO-O-O  4=BO-O  8=BO-O-O */
-int count[2][7];  /* count[color][piece_type], piece_type 1..6 */
-int ply;
-int halfmove_clock;   /* plies since last pawn move or capture; draw at 100 */
+int count[2][7];               /* count[color][piece_type], piece_type 1..6  */
 HASH hash_key;
 
-/* Search telemetry -- reported in UCI info lines */
-int64_t nodes_searched;
-int root_depth;
-int best_root_move;
+int64_t nodes_searched; int root_depth; int best_root_move; /* search telemetry, reported in UCI info lines */
 
 /* Time control -- set by the go command handler before calling search_root.
    time_budget_ms = milliseconds we are allowed to spend on this move.
@@ -385,9 +380,7 @@ HASH         zobrist_castle[16];
 /* xorshift64* PRNG */
 static HASH rand64(void) {
     static HASH s = 1070372631ULL;
-    s ^= s >> 12;
-    s ^= s << 25;
-    s ^= s >> 27;
+    s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
     return s * 0x2545F4914F6CDD1DULL;
 }
 
@@ -398,6 +391,9 @@ void init_zobrist(void) {
     for (int s = 0; s < 128; s++) zobrist_ep[s] = rand64();
     for (int s = 0; s < 16; s++) zobrist_castle[s] = rand64();
 }
+
+/* Populate lmr_table once at startup; called from uci_init.
+   Index 0 is unused (depth=0 or move=0 never reach LMR). */
 
 HASH generate_hash(void) {
     HASH h = 0; int sq;
@@ -418,19 +414,30 @@ HASH generate_hash(void) {
    from the target square and check if a capable enemy intercepts it.
 
    Implementation
-   Using the `step_dir` array (S3), we simulate piece movement originating
-   from the target square. For example, to check for knight attacks, we
-   fire knight-rays; if they hit an enemy knight, the square is attacked.
+   Using the `step_dir` array (S3), we fire ray-traces outward from `sq`.
+   Non-sliding pieces (pawns, knights, king) are checked with direct square
+   lookups. Sliders (bishop, rook, queen) use a while-loop that walks the
+   ray until it hits a piece or the board edge.  Separating leapers from
+   sliders removes the leaper-break branch from the hot slider inner loop.
 */
 
 static inline int is_square_attacked(int sq, int ac) {
-    /* Pawn check: two diagonal squares natively */
-    for (int i = -1; i <= 1; i += 2) {
-        int tgt = sq + ((ac == WHITE) ? -16 : 16) + i;
-        if (!sq_is_off(tgt) && !is_empty(tgt) && color_on(tgt) == ac && ptype_on(tgt) == PAWN) return 1;
+    int tgt;
+    /* Pawn attacks */
+    if (ac == WHITE) {
+        tgt = sq - 17; if (!sq_is_off(tgt) && board[tgt] == WP) return 1;
+        tgt = sq - 15; if (!sq_is_off(tgt) && board[tgt] == WP) return 1;
+    } else {
+        tgt = sq + 15; if (!sq_is_off(tgt) && board[tgt] == BP) return 1;
+        tgt = sq + 17; if (!sq_is_off(tgt) && board[tgt] == BP) return 1;
     }
-    /* Unified Ray-Tracing for Knights, Bishops, Rooks, Kings, and Queens */
-    for (int i = piece_offsets[KNIGHT]; i < piece_limits[KING]; i++) {
+    /* Knight attacks: eight L-shaped jumps */
+    for (int i = piece_offsets[KNIGHT]; i < piece_limits[KNIGHT]; i++)
+        if (!sq_is_off(sq + step_dir[i]) && board[sq + step_dir[i]] == make_piece(ac, KNIGHT)) return 1;
+    /* Slider attacks: bishops, rooks, queens.
+       piece_offsets[BISHOP]..piece_limits[QUEEN] covers all 8 ray directions.
+       Diagonal rays [BISHOP range] match bishops/queens; orthogonal [ROOK range] match rooks/queens. */
+    for (int i = piece_offsets[BISHOP]; i < piece_limits[QUEEN]; i++) {
         int step = step_dir[i], tgt = sq + step;
         while (!sq_is_off(tgt)) {
             int p = piece_on(tgt);
@@ -438,20 +445,19 @@ static inline int is_square_attacked(int sq, int ac) {
                 if (piece_color(p) == ac) {
                     int pt = piece_type(p);
                     /* The direction index i tells us which piece types
-                       can attack along this particular ray or jump. */
-                    if (i < piece_limits[KNIGHT] && pt == KNIGHT) return 1;
+                       can attack along this particular ray*/
                     if (i >= piece_offsets[BISHOP] && pt == QUEEN) return 1;
                     if (i >= piece_offsets[BISHOP] && i < piece_limits[BISHOP] && pt == BISHOP) return 1;
                     if (i >= piece_offsets[ROOK] && i < piece_limits[ROOK] && pt == ROOK) return 1;
-                    if (i >= piece_offsets[KING] && pt == KING) return 1;
                 }
                 break; /* A piece blocked the ray */
             }
-            /* Leapers cannot slide: break after checking one square */
-            if (i < piece_limits[KNIGHT] || i >= piece_offsets[KING]) break;
             tgt += step;
         }
     }
+    /* King attacks: eight one-step directions */
+    for (int i = piece_offsets[KING]; i < piece_limits[KING]; i++)
+        if (!sq_is_off(sq + step_dir[i]) && board[sq + step_dir[i]] == make_piece(ac, KING)) return 1;
     return 0;
 }
 
@@ -560,7 +566,9 @@ void make_move(Move m) {
     if (pt == PAWN && ((to - fr) == 32 || (fr - to) == 32)) { ep_square = fr + (side == WHITE ? 16 : -16); hash_key ^= zobrist_ep[ep_square]; }
 
     /* Changing side to move */
-    hash_key ^= zobrist_side; side ^= 1; xside ^= 1; ply++;
+    hash_key ^= zobrist_side; side ^= 1; xside ^= 1;
+    history[ply].in_check = is_square_attacked(king_sq(side), xside);
+    ply++;
 }
 
 void undo_move(void) {
@@ -570,8 +578,7 @@ void undo_move(void) {
 
     /* Move piece back: to -> fr */
     list_set_sq(list_index[to], fr); list_index[to] = -1;
-    board[fr] = board[to];
-    board[to] = cap;
+    board[fr] = board[to]; board[to] = cap;
 
     /* Undo promotion */
     if (pr) {
@@ -663,18 +670,26 @@ int generate_moves(Move* moves, int caps_only) {
             continue;
         }
 
-        /* -- Sliders & Leapers ------------------------------------ */
-        for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
-            int step = step_dir[i], tgt = sq + step;
-            while (!sq_is_off(tgt)) {
-                if (is_empty(tgt)) {
-                    if (!caps_only) add_move(moves, &cnt, sq, tgt, 0);
-                } else {
-                    if (color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
-                    break;
+        /* -- Leapers (knight / king): single step, no ray continuation -- */
+        if (pt == KNIGHT || pt == KING) {
+            for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
+                int tgt = sq + step_dir[i]; if (sq_is_off(tgt)) continue;
+                if (is_empty(tgt)) { if (!caps_only) add_move(moves, &cnt, sq, tgt, 0); }
+                else if (color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
+            }
+        } else {
+        /* -- Sliders (bishop / rook / queen): ray trace ----------- */
+            for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
+                int step = step_dir[i], tgt = sq + step;
+                while (!sq_is_off(tgt)) {
+                    if (is_empty(tgt)) {
+                        if (!caps_only) add_move(moves, &cnt, sq, tgt, 0);
+                    } else {
+                        if (color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
+                        break;
+                    }
+                    tgt += step;
                 }
-                if (pt == KNIGHT || pt == KING) break;
-                tgt += step;
             }
         }
 
@@ -709,6 +724,48 @@ int generate_moves(Move* moves, int caps_only) {
     return cnt;
 }
 
+/* Capture-only move generator for quiescence search.
+   Avoids all quiet-move branches and the entire castling block. */
+int generate_captures(Move* moves) {
+    int cnt = 0;
+    int d_pawn = (side == WHITE) ? 16 : -16;
+    int pawn_promo = (side == WHITE) ? 6 : 1;
+
+    for (int slot = (side == WHITE ? 0 : 16); slot < (side == WHITE ? 16 : 32); slot++) {
+        int sq = list_square[slot];
+        if (sq == LIST_OFF) continue;
+        int pt = list_piece[slot];
+
+        if (pt == PAWN) {
+            int tgt = sq + d_pawn;                                  /* quiet promo */
+            if ((sq >> 4) == pawn_promo && !sq_is_off(tgt) && is_empty(tgt))
+                add_promo(moves, &cnt, sq, tgt);
+            for (int i = -1; i <= 1; i += 2) {                     /* diagonal captures + ep */
+                tgt = sq + d_pawn + i;
+                if (!sq_is_off(tgt) && ((!is_empty(tgt) && color_on(tgt) == xside) || tgt == ep_square)) {
+                    if ((sq >> 4) == pawn_promo) add_promo(moves, &cnt, sq, tgt);
+                    else add_move(moves, &cnt, sq, tgt, 0);
+                }
+            }
+            continue;
+        }
+
+        if (pt == KNIGHT || pt == KING) {
+            for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
+                int tgt = sq + step_dir[i];
+                if (!sq_is_off(tgt) && !is_empty(tgt) && color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
+            }
+        } else {
+            for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
+                int step = step_dir[i], tgt = sq + step;
+                while (!sq_is_off(tgt) && is_empty(tgt)) tgt += step;
+                if (!sq_is_off(tgt) && color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
+            }
+        }
+    }
+    return cnt;
+}
+
 /* ===============================================================
    S8  FEN PARSER
    ===============================================================
@@ -726,15 +783,9 @@ int generate_moves(Move* moves, int caps_only) {
 */
 
 static int char_to_piece(char lo) {
-    switch (lo) {
-    case 'p': return PAWN;
-    case 'n': return KNIGHT;
-    case 'b': return BISHOP;
-    case 'r': return ROOK;
-    case 'q': return QUEEN;
-    case 'k': return KING;
-    default:  return EMPTY;
-    }
+    const char* m = "pnbrqk"; /* PAWN=1..KING=6 match i+1 */
+    for (int i = 0; i < 6; i++) if (lo == m[i]) return i + 1;
+    return EMPTY;
 }
 
 void parse_fen(const char* fen) {
@@ -823,66 +874,82 @@ void parse_fen(const char* fen) {
 */
 
 /* mg_pst[piece-1][sq]: middlegame, 16 vals/line = one rank pair, rank 1 first */
-static const int mg_pst[6][64] = {
-  {   0,  0,  0,  0,  0,  0,  0,  0,  -35, -6,-25,-22,-15, 18, 25,-26,  /* pawn   r1-r2 */
-    -26,-11, -4, -8,  5,  5, 22,-12,  -29, -5, -4, 14, 17,  6,  8,-27,  /*        r3-r4 */
-    -16, 12,  8, 23, 25, 14, 18,-25,   -6,  8, 19, 23, 38, 59, 26,-19,  /*        r5-r6 */
-     80, 76, 49, 54, 50, 57, 26, -3,    0,  0,  0,  0,  0,  0,  0,  0}, /*        r7-r8 */
-  {-106,-19,-56,-31,-15,-26,-20,-22,  -27,-51,-10, -1,  1, 20,-12,-17,  /* knight r1-r2 */
-    -25, -7, 10, 12, 21, 19, 27,-18,  -12,  6, 16, 12, 30, 20, 23, -7,  /*        r3-r4 */
-     -7, 18, 18, 55, 35, 70, 17, 23,  -47, 61, 37, 63, 85,128, 74, 42,  /*        r5-r6 */
-    -71,-40, 74, 37, 23, 64,  5,-15, -165,-87,-32,-47, 63,-96,-15,-105}, /*       r7-r8 */
-  { -32, -1,-12,-19,-11,-14,-39,-21,    5, 19, 17,  0,  9, 23, 36,  2,  /* bishop r1-r2 */
-     -2, 17, 15, 13, 12, 28, 19,  8,   -4, 15, 11, 27, 33, 10,  9,  5,  /*        r3-r4 */
-     -3,  3, 19, 52, 35, 35,  5, -3,  -18, 38, 43, 38, 35, 52, 37, -4,  /*        r5-r6 */
-    -26, 17,-17,-12, 32, 60, 20,-47,  -27,  5,-82,-36,-23,-40,  8, -7}, /*        r7-r8 */
-  { -17,-11,  2, 15, 14,  9,-39,-25,  -43,-15,-18,-10, -1, 13, -4,-72,  /* rook   r1-r2 */
-    -44,-23,-16,-17,  1,  2, -3,-34,  -38,-24,-13, -3,  9, -6,  6,-25,  /*        r3-r4 */
-    -22,-10,  5, 25, 22, 35, -8,-20,   -6, 19, 24, 34, 15, 46, 61, 16,  /*        r5-r6 */
-     25, 30, 56, 60, 78, 65, 24, 42,   33, 42, 31, 49, 62, 11, 33, 45}, /*        r7-r8 */
-  {  -2,-17, -7, 12,-13,-23,-29,-49,  -34, -9, 11,  4, 10, 17, -1,  3,  /* queen  r1-r2 */
-    -16,  0,-13, -4, -7,  0, 13,  5,  -11,-28,-11,-12, -4, -6,  1, -5,  /*        r3-r4 */
-    -29,-29,-18,-18, -3, 15, -3, -1,  -11,-19,  5,  6, 29, 58, 47, 57,  /*        r5-r6 */
-    -23,-41, -5,  3,-17, 59, 29, 56,  -26,  1, 31, 13, 61, 46, 45, 47}, /*        r7-r8 */
-  { -17, 36, 14,-56,  6,-26, 26, 12,    1,  8, -6,-66,-45,-14, 11,  7,  /* king   r1-r2 */
-    -13,-12,-20,-48,-46,-28,-13,-25,  -48,  1,-25,-41,-48,-42,-32,-53,  /*        r3-r4 */
-    -16,-18,-10,-29,-31,-25,-13,-35,   -7, 26,  4,-17,-22,  8, 24,-24,  /*        r5-r6 */
-     30,  1,-18, -5,-10, -2,-36,-28,  -66, 24, 18,-14,-58,-32,  3, 13}  /*        r7-r8 */
-};
+/* Readable version kept as comments */
+// static int mg_pst[6][64] = {
+//  {  82,   82,   82,   82,   82,   82,   82,   82,      47,  76,    57,   60,   67,  100,  107,   56,  /* pawn   r1-r2 */
+//     56,   71,   78,   74,   87,   87,  104,   70,      53,  77,    78,   96,   99,   88,   90,   55,  /*        r3-r4 */
+//     66,   94,   90,  105,  107,   96,  100,   57,      76,  90,   101,  105,  120,  141,  108,   63,  /*        r5-r6 */
+//    162,  158,  131,  136,  132,  139,  108,   79,      82,  82,    82,   82,   82,   82,   82,   82}, /*        r7-r8 */
 
+//  { 231,  318,  281,  306,  322,  311,  317,  315,     310,  286,  327,  336,  338,  357,  325,  320,  /* knight r1-r2 */
+//    312,  330,  347,  349,  358,  356,  364,  319,     325,  343,  353,  349,  367,  357,  360,  330,  /*        r3-r4 */
+//    330,  355,  355,  392,  372,  407,  354,  360,     290,  398,  374,  400,  422,  465,  411,  379,  /*        r5-r6 */
+//    266,  297,  411,  374,  360,  401,  342,  322,     172,  250,  305,  290,  400,  241,  322,  232}, /*       r7-r8 */
+
+//  { 333,  364,  353,  346,  354,  351,  326,  344,     370,  384,  382,  365,  374,  388,  401,  367,  /* bishop r1-r2 */
+//    363,  382,  380,  378,  377,  393,  384,  373,     361,  380,  376,  392,  398,  375,  374,  370,  /*        r3-r4 */
+//    362,  368,  384,  417,  400,  400,  370,  362,     347,  403,  408,  403,  400,  417,  402,  361,  /*        r5-r6 */
+//    339,  382,  348,  353,  397,  425,  385,  318,     338,  370,  283,  329,  342,  325,  373,  358}, /*        r7-r8 */
+
+//  { 460,  466,  479,  492,  491,  486,  438,  452,     434,  462,  459,  467,  476,  490,  473,  405,  /* rook   r1-r2 */
+//    433,  454,  461,  460,  478,  479,  474,  443,     439,  453,  464,  474,  486,  471,  483,  452,  /*        r3-r4 */
+//    455,  467,  482,  502,  499,  512,  469,  457,     471,  496,  501,  511,  492,  523,  538,  493,  /*        r5-r6 */
+//    502,  507,  533,  537,  555,  542,  501,  519,     510,  519,  508,  526,  539,  488,  510,  522}, /*        r7-r8 */
+ 
+//  {1023, 1008, 1018, 1037, 1012, 1002,  996,  976,     991, 1016, 1036, 1029, 1035, 1042, 1024, 1028,  /* queen  r1-r2 */
+//   1009, 1025, 1012, 1021, 1018, 1025, 1038, 1030,    1014,  997, 1014, 1013, 1021, 1019, 1026, 1020,  /*        r3-r4 */
+//    996,  996, 1007, 1007, 1022, 1040, 1022, 1024,    1014, 1006, 1030, 1031, 1054, 1083, 1072, 1082,  /*        r5-r6 */
+//   1002,  984, 1020, 1028, 1008, 1084, 1054, 1081,     999, 1026, 1056, 1038, 1086, 1071, 1070, 1072}, /*        r7-r8 */
+
+//  { -17,   36,   14,  -56,    6,  -26,   26,   12,       1,    8,   -6,  -66,  -45,  -14,   11,    7,  /* king   r1-r2 */
+//    -13,  -12,  -20,  -48,  -46,  -28,  -13,  -25,     -48,    1,  -25,  -41,  -48,  -42,  -32,  -53,  /*        r3-r4 */
+//    -16,  -18,  -10,  -29,  -31,  -25,  -13,  -35,      -7,   26,    4,  -17,  -22,    8,   24,  -24,  /*        r5-r6 */
+//     30,    1,  -18,   -5,  -10,   -2,  -36,  -28,     -66,   24,   18,  -14,  -58,  -32,    3,   13}  /*        r7-r8 */
+// };
 
 /* eg_pst[piece-1][sq]: endgame, same layout */
-static const int eg_pst[6][64] = {
-  {   0,  0,  0,  0,  0,  0,  0,  0,   14,  6,  8,  8, 12, -2,  0, -9,  /* pawn   r1-r2 */
-      2,  5, -8,  0,  0, -5, -3,-10,   11,  7, -5, -9, -9,-10,  1, -3,  /*        r3-r4 */
-     30, 22, 11,  3, -4,  2, 15, 15,   72, 69, 46, 25, 24, 31, 52, 62,  /*        r5-r6 */
-     95, 92, 86, 62, 65, 88, 93,124,    0,  0,  0,  0,  0,  0,  0,  0}, /*        r7-r8 */
-  { -27,-49,-21,-13,-20,-16,-48,-62,  -40,-18, -8, -3,  0,-18,-21,-42,  /* knight r1-r2 */
-    -21, -2, -1, 16, 12, -2,-18,-20,  -16, -4, 18, 27, 17, 17,  6,-16,  /*        r3-r4 */
-    -15,  5, 24, 24, 24, 12, 10,-20,  -22,-18,  9, 10, -3,-11,-19,-42,  /*        r5-r6 */
-    -23, -6,-24,  0, -9,-27,-26,-50,  -56,-36,-11,-26,-30,-25,-61,-98}, /*        r7-r8 */
-  { -21, -7,-21, -3, -7,-14, -3,-15,  -12,-16, -5,  1,  5, -7,-13,-26,  /* bishop r1-r2 */
-    -10, -1, 10, 10, 15,  2, -5,-13,   -4,  4, 14, 20,  7,  9, -2, -7,  /*        r3-r4 */
-     -1, 11, 13,  9, 14,  8,  4,  4,    4, -7,  0,  0,  0,  6,  2,  6,  /*        r5-r6 */
-     -6, -2,  9,-10, -2,-11, -4,-12,  -12,-19, -9, -6, -5, -7,-15,-22}, /*        r7-r8 */
-  {  -7,  4,  5, -1, -3,-11,  6,-18,   -4, -4,  2,  4, -7, -7, -9, -1,  /* rook   r1-r2 */
-     -2,  2, -3,  1, -5,-10, -6,-14,    5,  7, 10,  3, -4, -4, -6, -9,  /*        r3-r4 */
-      6,  5, 15,  0,  0,  3,  0,  4,    9,  9,  7,  4,  4, -1, -3, -1,  /*        r5-r6 */
-      9, 11, 11,  9, -5,  1,  6,  1,   15, 11, 20, 13, 12, 14, 10,  7}, /*        r7-r8 */
-  { -33,-27,-21,-41, -3,-31,-18,-40,  -20,-21,-28,-15,-15,-21,-34,-31,  /* queen  r1-r2 */
-    -14,-26, 15,  7, 10, 18, 12,  7,  -17, 30, 19, 48, 30, 36, 39, 25,  /*        r3-r4 */
-      4, 23, 23, 46, 59, 40, 59, 38,  -19,  6,  9, 50, 49, 37, 19, 11,  /*        r5-r6 */
-    -16, 22, 33, 43, 60, 27, 32,  1,   -7, 24, 23, 29, 29, 21, 12, 22}, /*        r7-r8 */
-  { -55,-36,-19,-12,-30,-12,-26,-45,  -28, -9,  6, 11, 12,  6, -3,-19,  /* king   r1-r2 */
-    -21, -1, 13, 19, 21, 18,  9,-10,  -19, -3, 23, 22, 25, 25, 11,-12,  /*        r3-r4 */
-    -10, 24, 26, 25, 24, 35, 28,  1,   10, 18, 24, 13, 18, 46, 45, 11,  /*        r5-r6 */
-    -12, 19, 16, 16, 15, 40, 25, 12,  -74,-34,-18,-20,-13, 17,  5,-19}  /*        r7-r8 */
-};
+// static int eg_pst[6][64] = {
+//   { 94,   94,   94,   94,   94,   94,   94,   94,    108,  100,  102,  102,  106,   92,   94,   85,  /* pawn   r1-r2 */
+//     96,   99,   86,   94,   94,   89,   91,   84,    105,  101,   89,   85,   85,   84,   95,   91,  /*        r3-r4 */
+//    124,  116,  105,   97,   90,   96,  109,  109,    166,  163,  140,  119,  118,  125,  146,  156,  /*        r5-r6 */
+//    189,  186,  180,  156,  159,  182,  187,  218,     94,   94,   94,   94,   94,   94,   94,   94}, /*        r7-r8 */
 
-/* Separate MG/EG material values (Rofchade).
-   piece_val[] is kept unchanged for MVV-LVA move ordering. */
-static const int mg_val[6] = { 82, 337, 365, 477, 1025,    0 };
-static const int eg_val[6] = { 94, 281, 297, 513,  937,    0 };
+//   {254,  232,  260,  268,  261,  265,  233,  219,    241,  263,  273,  278,  281,  263,  260,  239,  /* knight r1-r2 */
+//    260,  279,  280,  297,  293,  279,  263,  261,    265,  277,  299,  308,  298,  298,  287,  265,  /*        r3-r4 */
+//    266,  286,  305,  305,  305,  293,  291,  261,    259,  263,  290,  291,  278,  270,  262,  239,  /*        r5-r6 */
+//    258,  275,  257,  281,  272,  254,  255,  231,    225,  245,  270,  255,  251,  256,  220,  183}, /*        r7-r8 */
+
+//   {276,  290,  276,  294,  290,  283,  294,  282,    285,  281,  292,  298,  302,  290,  284,  271,  /* bishop r1-r2 */
+//    287,  296,  307,  307,  312,  299,  292,  284,    293,  301,  311,  317,  304,  306,  295,  290,  /*        r3-r4 */
+//    296,  308,  310,  306,  311,  305,  301,  301,    301,  290,  297,  297,  297,  303,  299,  303,  /*        r5-r6 */
+//    291,  295,  306,  287,  295,  286,  293,  285,    285,  278,  288,  291,  292,  290,  282,  275}, /*        r7-r8 */
+
+//   {506,  517,  518,  512,  510,  502,  519,  495,    509,  509,  515,  517,  506,  506,  504,  512,  /* rook   r1-r2 */
+//    511,  515,  510,  514,  508,  503,  507,  499,    518,  520,  523,  516,  509,  509,  507,  504,  /*        r3-r4 */
+//    519,  518,  528,  513,  513,  516,  513,  517,    522,  522,  520,  517,  517,  512,  510,  512,  /*        r5-r6 */
+//    522,  524,  524,  522,  508,  514,  519,  514,    528,  524,  533,  526,  525,  527,  523,  520}, /*        r7-r8 */
+
+//   {904,  910,  916,  896,  934,  906,  919,  897,    917,  916,  909,  922,  922,  916,  903,  906,  /* queen  r1-r2 */
+//    923,  911,  952,  944,  947,  955,  949,  944,    920,  967,  956,  985,  967,  973,  976,  962,  /*        r3-r4 */
+//    941,  960,  960,  983,  996,  977,  996,  975,    918,  943,  946,  987,  986,  974,  956,  948,  /*        r5-r6 */
+//    921,  959,  970,  980,  997,  964,  969,  938,    930,  961,  960,  966,  966,  958,  949,  959}, /*        r7-r8 */
+  
+//   {-55,  -36,  -19,  -12,  -30,  -12,  -26,  -45,    -28,   -9,    6,   11,   12,    6,   -3,  -19,  /* king   r1-r2 */
+//    -21,   -1,   13,   19,   21,   18,    9,  -10,    -19,   -3,   23,   22,   25,   25,   11,  -12,  /*        r3-r4 */
+//    -10,   24,   26,   25,   24,   35,   28,    1,     10,   18,   24,   13,   18,   46,   45,   11,  /*        r5-r6 */
+//    -12,   19,   16,   16,   15,   40,   25,   12,    -74,  -34,  -18,  -20,  -13,   17,    5,  -19}  /*        r7-r8 */
+// };
+
+static int mg_pst[6][64] = { { 82, 82, 82, 82, 82, 82, 82, 82,  47, 76, 57, 60, 67,100,107, 56,  56, 71, 78, 74, 87, 87,104, 70,  53, 77, 78, 96, 99, 88, 90, 55,  66, 94, 90,105,107, 96,100, 57,  76, 90,101,105,120,141,108, 63, 162,158,131,136,132,139,108, 79,  82, 82, 82, 82, 82, 82, 82, 82}, {231,318,281,306,322,311,317,315, 310,286,327,336,338,357,325,320, 312,330,347,349,358,356,364,319, 325,343,353,349,367,357,360,330, 330,355,355,392,372,407,354,360, 290,398,374,400,422,465,411,379, 266,297,411,374,360,401,342,322, 172,250,305,290,400,241,322,232}, {333,364,353,346,354,351,326,344, 370,384,382,365,374,388,401,367, 363,382,380,378,377,393,384,373, 361,380,376,392,398,375,374,370, 362,368,384,417,400,400,370,362, 347,403,408,403,400,417,402,361, 339,382,348,353,397,425,385,318, 338,370,283,329,342,325,373,358}, {460,466,479,492,491,486,438,452, 434,462,459,467,476,490,473,405, 433,454,461,460,478,479,474,443, 439,453,464,474,486,471,483,452, 455,467,482,502,499,512,469,457, 471,496,501,511,492,523,538,493, 502,507,533,537,555,542,501,519, 510,519,508,526,539,488,510,522}, {1023,1008,1018,1037,1012,1002,996,976, 991,1016,1036,1029,1035,1042,1024,1028, 1009,1025,1012,1021,1018,1025,1038,1030, 1014,997,1014,1013,1021,1019,1026,1020, 996,996,1007,1007,1022,1040,1022,1024, 1014,1006,1030,1031,1054,1083,1072,1082, 1002,984,1020,1028,1008,1084,1054,1081, 999,1026,1056,1038,1086,1071,1070,1072}, { -17, 36, 14,-56,  6,-26, 26, 12,   1,  8, -6,-66,-45,-14, 11,  7, -13,-12,-20,-48,-46,-28,-13,-25, -48,  1,-25,-41,-48,-42,-32,-53, -16,-18,-10,-29,-31,-25,-13,-35,  -7, 26,  4,-17,-22,  8, 24,-24,  30,  1,-18, -5,-10, -2,-36,-28, -66, 24, 18,-14,-58,-32,  3, 13} };
+static int eg_pst[6][64] = { { 94, 94, 94, 94, 94, 94, 94, 94, 108,100,102,102,106, 92, 94, 85,  96, 99, 86, 94, 94, 89, 91, 84, 105,101, 89, 85, 85, 84, 95, 91, 124,116,105, 97, 90, 96,109,109, 166,163,140,119,118,125,146,156, 189,186,180,156,159,182,187,218,  94, 94, 94, 94, 94, 94, 94, 94}, {254,232,260,268,261,265,233,219, 241,263,273,278,281,263,260,239, 260,279,280,297,293,279,263,261, 265,277,299,308,298,298,287,265, 266,286,305,305,305,293,291,261, 259,263,290,291,278,270,262,239, 258,275,257,281,272,254,255,231, 225,245,270,255,251,256,220,183}, {276,290,276,294,290,283,294,282, 285,281,292,298,302,290,284,271, 287,296,307,307,312,299,292,284, 293,301,311,317,304,306,295,290, 296,308,310,306,311,305,301,301, 301,290,297,297,297,303,299,303, 291,295,306,287,295,286,293,285, 285,278,288,291,292,290,282,275}, {506,517,518,512,510,502,519,495, 509,509,515,517,506,506,504,512, 511,515,510,514,508,503,507,499, 518,520,523,516,509,509,507,504, 519,518,528,513,513,516,513,517, 522,522,520,517,517,512,510,512, 522,524,524,522,508,514,519,514, 528,524,533,526,525,527,523,520}, {904,910,916,896,934,906,919,897, 917,916,909,922,922,916,903,906, 923,911,952,944,947,955,949,944, 920,967,956,985,967,973,976,962, 941,960,960,983,996,977,996,975, 918,943,946,987,986,974,956,948, 921,959,970,980,997,964,969,938, 930,961,960,966,966,958,949,959}, {-55,-36,-19,-12,-30,-12,-26,-45, -28, -9,  6, 11, 12,  6, -3,-19, -21, -1, 13, 19, 21, 18,  9,-10, -19, -3, 23, 22, 25, 25, 11,-12, -10, 24, 26, 25, 24, 35, 28,  1,  10, 18, 24, 13, 18, 46, 45, 11, -12, 19, 16, 16, 15, 40, 25, 12, -74,-34,-18,-20,-13, 17,  5,-19} };
+
+static void init_lmr(void) {
+    for (int d = 1; d < 32; d++)
+        for (int m = 1; m < 64; m++) {
+            int r = (int)round(log(d) * log(m) / 1.6);
+            lmr_table[d][m] = r < 1 ? 1 : r > 5 ? 5 : r;
+        }
+}
 
 /* Phase contribution per piece type (indexed by TYPE(): 1=pawn..6=king).
    knight=1, bishop=1, rook=2, queen=4; max total = 24. */
@@ -899,6 +966,7 @@ static const int mob_step_mg[7] = { 0, 0, 3, 4, 3, 2, 0 };
 static const int mob_step_eg[7] = { 0, 0, 3, 4, 4, 2, 0 };
 
 static inline int max(int a, int b) { return a > b ? a : b; }
+static inline int min(int a, int b) { return a < b ? a : b; }
 static inline int distance(int s1, int s2) { return max(abs((s1 & 7) - (s2 & 7)), abs((s1 >> 4) - (s2 >> 4))); }
 static inline void add_score(int* mg, int* eg, int color, int mg_v, int eg_v) { mg[color] += mg_v; eg[color] += eg_v; }
 
@@ -912,10 +980,7 @@ int evaluate(void) {
     int pr_list[32], pr_index = 0, i;
 
     mg[WHITE] = mg[BLACK] = eg[WHITE] = eg[BLACK] = phase = 0;
-    for (int i = 0; i < 8; i++) {
-        lowest_pawn_rank[WHITE][i] = 7;
-        lowest_pawn_rank[BLACK][i] = 7;
-    }
+    for (int i = 0; i < 8; i++) lowest_pawn_rank[WHITE][i] = lowest_pawn_rank[BLACK][i] = 7;
 
     /* First pass: material, PST, phase, mobility.
        Pawns and rooks are also recorded into pr_list for the second pass. */
@@ -941,7 +1006,7 @@ int evaluate(void) {
 
         /* Material + PST: scored into MG and EG accumulators separately.
            pt-1 converts TYPE() (1-based) to the 0-based table index. */
-        add_score(mg, eg, color, mg_val[pt - 1] + mg_pst[pt - 1][idx], eg_val[pt - 1] + eg_pst[pt - 1][idx]);
+        add_score(mg, eg, color, mg_pst[pt - 1][idx], eg_pst[pt - 1][idx]);
         phase += phase_inc[pt];
 
         /* Mobility: count pseudo-legal reachable squares, centered so that
@@ -1090,15 +1155,9 @@ int evaluate(void) {
 */
 
 static inline int pawn_defended_by_pawn(int s) {
-    int p = piece_on(s);
-    if (!p || piece_type(p) != PAWN) return 0;
-
-    int c = piece_color(p);
-    int att_sq1 = s + (c == WHITE ? -17 : 15);
-    int att_sq2 = s + (c == WHITE ? -15 : 17);
-
-    return (!sq_is_off(att_sq1) && piece_is(att_sq1, c, PAWN)) ||
-        (!sq_is_off(att_sq2) && piece_is(att_sq2, c, PAWN));
+    int p = piece_on(s); if (!p || piece_type(p) != PAWN) return 0;
+    int c = piece_color(p), a1 = s+(c==WHITE?-17:15), a2 = s+(c==WHITE?-15:17);
+    return (!sq_is_off(a1) && piece_is(a1,c,PAWN)) || (!sq_is_off(a2) && piece_is(a2,c,PAWN));
 }
 
 static inline int score_move(Move m, Move hash_move, int sply) {
@@ -1184,26 +1243,6 @@ static void pick_move(Move* moves, int* scores, int n, int idx) {
 */
 
 /* ---------------------------------------------------------------
-   ADAPTIVE LMR REDUCTION TABLE
-   Reduction R scales with both search depth and move number:
-     R = round(ln(depth) * ln(move_number) / 1.6), clamped to [1, 5].
-   No reduction for depth < 3 or move_number < 4 (threshold guard).
-   "Adaptive" because R grows continuously rather than using fixed
-   buckets (0 / 1 / 2), better matching the empirical cost-benefit
-   curve of late-move pruning at increasing depths.
---------------------------------------------------------------- */
-static int lmr_table[32][64];
-
-static void init_lmr(void) {
-    for (int d = 0; d < 32; d++)
-        for (int m = 0; m < 64; m++) {
-            if (d < 3 || m < 4) { lmr_table[d][m] = 0; continue; }
-            double r = 0.5 + log((double)d) * log((double)m) / 1.8;
-            lmr_table[d][m] = (int)(r < 1 ? 1 : r > 5 ? 5 : r);
-        }
-}
-
-/* ---------------------------------------------------------------
    print_move / print_pv  -- formatting helpers
    ---------------------------------------------------------------
    A chess move in UCI format: <from><to>[promo], e.g. "e2e4", "a7a8q".
@@ -1218,10 +1257,7 @@ void print_move(Move m) {
 }
 
 static void print_pv(void) {
-    for (int k = 0; k < pv_length[0]; k++) {
-        putchar(' ');
-        print_move(pv[0][k]);
-    }
+    for (int k = 0; k < pv_length[0]; k++) { putchar(' '); print_move(pv[0][k]); }
 }
 
 void print_result(int best_sc) {
@@ -1246,15 +1282,239 @@ void print_result(int best_sc) {
     print_pv(); printf("\n"); fflush(stdout);
 }
 
-int search(int depth, int alpha, int beta, int was_null, int sply) {
+/* ---------------------------------------------------------------
+   qsearch  -- quiescence search (captures only)
+   ---------------------------------------------------------------
+   At depth 0 the horizon effect can cause tactical blindness: the
+   engine stops thinking just as a piece is hanging.  Quiescence
+   search extends the tree with captures until the position is
+   "quiet," eliminating this horizon distortion.
+
+   Stand-pat: the side to move can always decline further captures,
+   so we initialise best_sc = static eval.  If that already exceeds
+   beta we prune immediately (standing pat is good enough).
+
+   Delta pruning: if even capturing the most valuable piece on the
+   board plus a safety margin cannot raise alpha, skip the subtree
+   entirely -- no capture can possibly help.
+
+   SEE pruning replaces the old pawn-defended-pawn heuristic with a
+   full exchange evaluation: any capture where SEE < 0 is skipped.
+--------------------------------------------------------------- */
+
+static inline int line_step(int from, int to) {
+    int diff = to - from;
+
+    if ((from & 7) == (to & 7))         return (diff > 0) ? 16 : -16;  /* same file */
+    if ((from >> 4) == (to >> 4))       return (diff > 0) ? 1 : -1;  /* same rank */
+    if (diff % 17 == 0)                 return (diff > 0) ? 17 : -17;  /* main diagonal */
+    if (diff % 15 == 0)                 return (diff > 0) ? 15 : -15;  /* anti-diagonal */
+
+    return 0; /* not aligned */
+}
+
+/* ---------------------------------------------------------------
+   piece_attacks_sq  --  does the piece on `from` attack `to`?
+   Squares in cleared[] are treated as empty for slider ray tracing,
+   which lets sliding pieces "see through" captured pieces (x-rays).
+--------------------------------------------------------------- */
+static int piece_attacks_sq(int from, int to) {
+    int diff = to - from;
+    int pt  = ptype_on(from);
+    int col = color_on(from);
+
+    if (pt == PAWN) {
+        return diff == ((col == WHITE) ? 15 : -17)
+            || diff == ((col == WHITE) ? 17 : -15);
+    }
+
+    if (pt == KNIGHT) {
+        return diff == -33 || diff == -31 || diff == -18 || diff == -14 ||
+               diff == 14 || diff == 18 || diff == 31 || diff == 33;
+    }
+
+    if (pt == KING) {
+        return diff == -17 || diff == -16 || diff == -15 || diff == -1 ||
+               diff == 1 || diff == 15 || diff == 16 || diff == 17;
+    }
+
+    /* Sliders */
+    int step = line_step(from, to);
+    if (!step) return 0;
+
+    if (pt == BISHOP && step != -17 && step != -15 && step != 15 && step != 17) return 0;
+    if (pt == ROOK && step != -16 && step != -1 && step != 1 && step != 16) return 0;
+
+    for (int sq = from + step; !(sq & 0x88); sq += step) {
+        if (sq == to) return 1;
+        if (!is_empty(sq) && see_cleared[sq] != see_sentinel) break;
+    }
+
+    return 0;
+}
+
+/* ---------------------------------------------------------------
+   see  --  Static Exchange Evaluation
+   Simulates all captures on `to`, starting with the piece on `from`.
+   Returns net material gain (cp) for the side making the first capture.
+   Negative = losing exchange.  X-rays are handled naturally: when a
+   piece is marked cleared[], sliders behind it join the exchange.
+--------------------------------------------------------------- */
+static int see(int from, int to) {
+   
+    if (see_sentinel >= 16384) {
+        see_sentinel = 1;
+        memset(see_cleared, 0, sizeof(see_cleared));
+    }
+    else see_sentinel++;
+
+    int cap_type = ptype_on(to);
+    if (!cap_type) return 0;   /* en passant: captured pawn not on `to`, treat as even */
+
+    see_cleared[from] = see_sentinel;
+
+    /* target_seq[d] = type of piece sitting on `to` that gets captured at step d.
+       Step 0 = initial capture; step d+1 = recapture of what step d placed. */
+    int target_seq[32];
+    int nsteps = 0;
+    target_seq[0] = cap_type;
+
+    int piece_on_to = ptype_on(from); /* attacker now sits on `to` */
+    int cur_side    = color_on(from) ^ 1;
+
+    while (nsteps < 31) {
+        /* Find least-valuable attacker of `to` for cur_side, skipping cleared squares */
+        int lva_sq = -1, lva_type = 0, lva_val = INF;
+        int base = (cur_side == WHITE) ? 0 : 16;
+        int top  = base + list_count[cur_side];
+        for (int i = base; i < top; i++) {
+            int psq = list_square[i];
+            if (psq == LIST_OFF) continue; /* captured in game */
+            if (see_cleared[psq] == see_sentinel) continue;    /* already used in this exchange */
+            int pv = piece_val[list_piece[i]];
+            if (pv < lva_val && piece_attacks_sq(psq, to)) {
+                lva_val  = pv;
+                lva_sq   = psq;
+                lva_type = list_piece[i];
+            }
+        }
+        if (lva_sq < 0) break;
+
+        target_seq[nsteps + 1] = piece_on_to;
+        see_cleared[lva_sq] = see_sentinel;
+        piece_on_to = lva_type;
+        cur_side ^= 1;
+        nsteps++;
+    }
+
+    /* Walk back: each player can stop (gain 0) rather than continue losing.
+       result = opponent's maximum gain from step d onward. */
+    int result = 0;
+    for (int d = nsteps - 1; d >= 0; d--) {
+        int gain = piece_val[target_seq[d + 1]] - result;
+        result = gain > 0 ? gain : 0;
+    }
+    return piece_val[cap_type] - result;
+}
+
+/* Returns 1 if the capture from->to is obviously or probably losing.
+   Fast path: attacker <= victim means SEE >= 0, so skip the full exchange. */
+static inline int is_bad_capture(int from, int to) {
+    if (piece_val[ptype_on(from)] <= piece_val[ptype_on(to)]) return 0;
+    return see(from, to) < 0;
+}
+
+static int qsearch(int alpha, int beta, int sply) {
+    Move moves[256]; int best_sc, sc;
+
+    pv_length[sply] = sply;
+
+    /* Time check -- same cadence as main search */
+    if ((nodes_searched & 1023) == 0 && time_budget_ms > 0) {
+        int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
+        if (ms >= time_budget_ms) { time_over_flag = 1; return 0; }
+    }
+    if (time_over_flag) return 0;
+
+    /* Stand-pat: static eval as lower bound (we can always stop capturing) */
+    best_sc = evaluate();
+    if (best_sc >= beta) return best_sc;
+    if (best_sc > alpha) alpha = best_sc;
+
+    nodes_searched++;
+
+    int cnt = generate_captures(moves);
+    int scores[256];
+    score_moves(moves, scores, cnt, 0, sply);
+
+    for (int i = 0; i < cnt; i++) {
+        pick_move(moves, scores, cnt, i);
+
+        /* DELTA PRUNING: skip if even the captured piece + margin cannot raise alpha */
+        int dp_cap = piece_on(move_to(moves[i]));
+        int dp_ep  = (!dp_cap && ptype_on(move_from(moves[i])) == PAWN
+                      && move_to(moves[i]) == ep_square);
+        if (dp_cap || dp_ep) {
+            int cap_val = dp_cap ? piece_val[piece_type(dp_cap)] : piece_val[PAWN];
+            if (best_sc + cap_val + 200 < alpha) continue;
+        }
+
+        /* QS SEE PRUNING: skip captures that lose material in the full exchange.
+           Promotions are always searched (large material swing).
+           En passant returns SEE == 0 (ptype_on(to) == 0) so is kept. */
+        if (!move_promo(moves[i]) && is_bad_capture(move_from(moves[i]), move_to(moves[i])))
+            continue;
+
+        make_move(moves[i]);
+        if (is_illegal()) { undo_move(); continue; }
+
+        sc = -qsearch(-beta, -alpha, sply + 1);
+        undo_move();
+
+        if (sc > best_sc) best_sc = sc;
+        if (sc > alpha) {
+            alpha = sc;
+            if (!time_over_flag && moves[i] != 0) {
+                pv[sply][sply] = moves[i];
+                for (int k_ = sply + 1; k_ < pv_length[sply + 1]; k_++) pv[sply][k_] = pv[sply + 1][k_];
+                pv_length[sply] = pv_length[sply + 1];
+            }
+        }
+        if (alpha >= beta) break;
+    }
+    return best_sc;
+}
+
+/* ---------------------------------------------------------------
+   search  -- negamax alpha-beta with TT, PVS, and killers
+   ---------------------------------------------------------------
+   Negamax: the score for the side to move equals the negation of
+   the best score the opponent achieves.  One recursive function
+   replaces the classical minimax pair.
+
+   Alpha-beta: maintain a window [alpha, beta].  Alpha = best score
+   the maximising side is guaranteed; beta = best the minimising
+   side is guaranteed.  Any subtree that cannot improve on these
+   bounds is pruned immediately.
+
+   Principal Variation Search (PVS): the first legal move is
+   searched with the full [alpha, beta] window.  Every subsequent
+   move is probed with a null window (-alpha-1, -alpha) -- if our
+   current best is truly best they fail low cheaply.  A null-window
+   score that beats alpha triggers a full re-search on PV nodes.
+
+   Check extension: if the move gives check, extend by 1 ply so the
+   engine never horizon-drops while the opponent is in check.
+--------------------------------------------------------------- */
+int search(int depth, int alpha, int beta, int sply, int was_null) {
     Move moves[256], best = 0, hash_move = 0;
-    int legal = 0, quiet = 0, best_sc, old_alpha = alpha, sc;
+    int legal = 0, best_sc, old_alpha = alpha, sc;
     int is_pv = (beta - alpha > 1); /* PV node: wide window, not a null-window probe */
     TTEntry* e = &tt[hash_key % (HASH)tt_size];
 
-    /* Clear PV at this ply before any early returns (TT hits, stand-pat, repetition).
-       If we return early the parent reads pv_length[sply] to know how much of the
-       child continuation to copy; it must equal sply (empty) not a stale value. */
+    /* Clear PV at this ply before any early returns (TT hits, repetition).
+       The parent reads pv_length[sply] to splice in the child continuation;
+       it must equal sply (empty) rather than a stale value. */
     pv_length[sply] = sply;
 
     /* HARD TIME LIMIT CHECK
@@ -1265,6 +1525,9 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         if (ms >= time_budget_ms) { time_over_flag = 1; return 0; }
     }
     if (time_over_flag) return 0;
+
+    /* Drop into quiescence search at the horizon */
+    if (depth <= 0) return qsearch(alpha, beta, sply);
 
     /* REPETITION DETECTION
        Two rules apply, depending on whether the repeated position is inside
@@ -1286,11 +1549,9 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         /* Repetition detection */
         for (int i = ply - 2; i >= root_ply; i -= 2)
             if (history[i].hash_prev == hash_key) return 0;
-        {
-            int reps = 0;
-            for (int i = ply - 2; i >= 0 && i >= ply - halfmove_clock; i -= 2)
-                if (history[i].hash_prev == hash_key && ++reps >= 2) return 0;
-        }
+        int reps = 0;
+        for (int i = ply - 2; i >= 0 && i >= ply - halfmove_clock; i -= 2)
+            if (history[i].hash_prev == hash_key && ++reps >= 2) return 0;
 
         /* 50-move rule */
         if (halfmove_clock >= 100) return 0;
@@ -1300,12 +1561,9 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
            (KNK or KBK). With one minor per side the corner-checkmate edge case
            means we cannot safely claim a draw. */
         {
-            int wminor = count[WHITE][KNIGHT] + count[WHITE][BISHOP];
-            int bminor = count[BLACK][KNIGHT] + count[BLACK][BISHOP];
-            if (wminor + bminor == 1
-                && count[WHITE][PAWN] == 0 && count[BLACK][PAWN] == 0
-                && count[WHITE][ROOK] == 0 && count[BLACK][ROOK] == 0
-                && count[WHITE][QUEEN] == 0 && count[BLACK][QUEEN] == 0)
+            int wm = count[WHITE][KNIGHT]+count[WHITE][BISHOP], bm = count[BLACK][KNIGHT]+count[BLACK][BISHOP];
+            if (wm+bm==1 && !count[WHITE][PAWN] && !count[BLACK][PAWN]
+                && !count[WHITE][ROOK] && !count[BLACK][ROOK] && !count[WHITE][QUEEN] && !count[BLACK][QUEEN])
                 return 0;
         }
     }
@@ -1330,171 +1588,155 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         }
     }
 
-    /* Quiescence: stand-pat evaluation when out of depth */
-    int caps_only = (depth <= 0);
-    if (caps_only) {
-        best_sc = evaluate();
-        if (best_sc >= beta) return best_sc;
-        if (best_sc > alpha) alpha = best_sc;
-    } else {
-        best_sc = -INF;
-    }
-
+    best_sc = -INF;
     nodes_searched++;
 
-    /* REVERSE FUTILITY PRUNING (RFP) and RAZORING -- both use static eval,
-       so we compute it once and apply both tests. */
-    if (!caps_only && depth <= 7 && beta < MATE - MAX_PLY && !in_check(side)) {
-        int static_eval = evaluate();
-        /* RFP: if eval beats beta by a margin, prune immediately. */
-        if (depth >= 1 && static_eval - 70 * depth >= beta)
+    /* Cache whether the side to move is currently in check.
+       RFP, NMP, and IIR all guard on this -- compute once, reuse three times. */
+    int node_in_check = (sply > 0) ? history[ply - 1].in_check : in_check(side);
+
+    /* REVERSE FUTILITY PRUNING (RFP)
+       If static eval is already well above beta at shallow depth, the
+       position is unlikely to become worse after a quiet move -- prune
+       immediately. Zero nodes spent per pruned node.
+       Guards: not at root (sply>0), not in check, not a mate score. */
+    /* Compute static eval once; shared by RFP, razoring, and NMP guard below.
+       Skipped entirely when in check (no pruning applies). */
+    int static_eval = (!is_pv && sply > 0 && !node_in_check && beta < MATE - MAX_PLY && depth <= 7)
+                      ? evaluate() : -INF;
+
+    if (static_eval != -INF) {
+        /* REVERSE FUTILITY PRUNING (RFP) */
+        if (depth <= 7 && static_eval - 70 * depth >= beta)
             return static_eval - 70 * depth;
-        /* RAZORING: if eval is far below alpha even accounting for captures,
-           drop into quiescence search rather than searching full depth. */
-        if (!is_pv && depth <= 3 && static_eval + 300 + 60 * depth < alpha)
-            return search(0, alpha, beta, 0, sply);
+        /* RAZORING: if eval is far below alpha even after the best capture,
+           there is no point searching -- drop straight into qsearch. */
+        if (depth <= 3 && static_eval + 300 + 60 * depth < alpha)
+            return qsearch(alpha, beta, sply);
     }
 
     /* NULL MOVE PRUNING (NMP)
-       Skip our turn; if the opponent still cannot beat beta at reduced
-       depth, prune immediately. R=2 normally, R=3 at depth >= 6.
+       Guard: static_eval >= beta ensures we're not in a losing position --
+       passing the turn when already losing is pointless and wastes a search.
+       R=3 normally, R=4 at depth >= 7.
+       Guards: not a PV node, no consecutive null moves (was_null),
+       not in check, and the side to move has non-pawn material
+       (zugzwang guard -- in pure pawn endings passing is often worst). */
+    if (!is_pv && sply > 0 && depth >= 3 && !was_null
+        && !node_in_check && beta < MATE - MAX_PLY
+        && (count[side][KNIGHT] + count[side][BISHOP]
+            + count[side][ROOK]  + count[side][QUEEN] > 0)) {
 
-       ZUGZWANG GUARD: pure pawn endgames can be genuine zugzwang where
-       passing really is the worst move. We skip NMP when the side to
-       move has no non-pawn non-king piece, making the null move
-       assumption safe in all normal middlegame and endgame positions.  */
-    if (!caps_only && !is_pv && !was_null && depth >= 3
-        && (count[side][KNIGHT] + count[side][BISHOP] + count[side][ROOK] + count[side][QUEEN] > 0)
-        && !in_check(side)) {
-        int R = (depth >= 7) ? 4 : 3, ep_sq_prev = ep_square;
-        hash_key ^= zobrist_side;
-        if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
-        ep_square = SQ_NONE; side ^= 1; xside ^= 1;
-        history[ply].hash_prev = hash_key; /* push null move to history for repetition detection */
-        ply++;
-        sc = -search(depth - R - 1, -beta, -beta + 1, 1, sply + 1);
-        ply--; side ^= 1; xside ^= 1; ep_square = ep_sq_prev;
-        if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
-        hash_key ^= zobrist_side;
-        if (sc >= beta) return sc;  /* fail-soft: return actual score, not beta */
+        if (static_eval == -INF) static_eval = evaluate();
+
+        if (static_eval >= beta) {
+            int R = depth >= 7 ? 4 : 3;
+            int ep_prev = ep_square;
+            hash_key ^= zobrist_side;
+            if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
+            ep_square = SQ_NONE;
+            side ^= 1; xside ^= 1;
+            history[ply].hash_prev = hash_key; ply++; /* push null move so repetition detection sees it */
+            int null_sc = -search(depth - R - 1, -beta, -beta + 1, sply + 1, 1);
+            ply--; side ^= 1; xside ^= 1;
+            ep_square = ep_prev;
+            if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
+            hash_key ^= zobrist_side;
+            if (null_sc >= beta) return null_sc;
+        }
     }
 
     /* INTERNAL ITERATIVE REDUCTIONS (IIR)
-       Without a TT move to guide ordering, deep searches are unreliable.
-       Reduce depth by 1 -- the resulting TT entry will improve ordering
-       on the next iteration at the cost of one cheap extra search.       */
-    if (!caps_only && depth >= 4 && !hash_move && !in_check(side)) depth--;
+       If no hash move is available, the move ordering at this node is poor.
+       Reduce depth by 1 to avoid spending too much time on a badly-ordered
+       node; the resulting TT entry will guide a future full-depth search.
+       Guards: depth >= 4 so we don't reduce already-shallow nodes;
+       not in check -- evasions must be searched at full depth. */
+    if (depth >= 4 && !hash_move && !node_in_check) depth--;
 
-    int cnt = generate_moves(moves, caps_only);
+    int cnt = generate_moves(moves, 0);
     int scores[256];
     score_moves(moves, scores, cnt, hash_move, sply);
-    /* Track quiet moves in order so the malus loop has an explicit list
-       (avoids re-checking board[] state after moves are undone). */
-    Move quiet_moves[256]; int nquiet = 0;
-    int node_in_check = !caps_only && in_check(side); /* cached once -- board unchanged until make_move */
+    /* quiet_moves tracks searched quiet moves in order so the history malus
+       loop can penalise them without re-examining board[] after undo_move. */
+    Move quiet_moves[256]; int nquiet = 0, quiet = 0;
 
     for (int i = 0; i < cnt; i++) {
         pick_move(moves, scores, cnt, i);
 
-        /* DELTA PRUNING (Quiescence only)
-           If capturing this piece plus a safety margin can't possibly
-           raise alpha, skip generating the recursive tree.
-           En-passant lands on an empty square so check ep_square too. */
-        if (caps_only) {
-            int dp_cap = piece_on(move_to(moves[i]));
-            int dp_ep = (!dp_cap
-                && ptype_on(move_from(moves[i])) == PAWN
-                && move_to(moves[i]) == ep_square);
-            if (dp_cap || dp_ep) {
-                int cap_val = dp_cap ? piece_val[piece_type(dp_cap)] : piece_val[PAWN];
-                if (best_sc + cap_val + 200 < alpha) continue;
-            }
-
-            /* PAWN-DEFENDED PAWN PRUNING (Quiescence only)
-               Skip captures of a pawn that is defended by another pawn --
-               a non-pawn piece taking a pawn guarded by a pawn is almost
-               always losing material. More expensive than delta pruning so
-               placed after it. */
-            if (dp_cap && ptype_on(move_from(moves[i])) != PAWN) {
-                if (pawn_defended_by_pawn(move_to(moves[i])))
-                    continue;
-            }
-        }
-
-        /* Capture flag must be read before make_move: after the call
-           board[TO] always holds a piece, making a post-move test useless.
-           En-passant has an empty destination, so check ep_square too.    */
+        /* Capture flag read before make_move: after the call board[to] holds
+           a piece regardless, making a post-move test useless.
+           En-passant has an empty destination, so check ep_square too. */
         int is_cap = !is_empty(move_to(moves[i]))
-                   || (ptype_on(move_from(moves[i])) == PAWN
-                && move_to(moves[i]) == ep_square);
-        /* HISTORY PRUNING: skip quiet moves with very negative history at
-           shallow depths.  Done before make_move to avoid the undo cost.
-           Guarded by node_in_check: when we are in check, every quiet move
-           may be the only legal defence, so we must not prune any of them. */
-        if (!caps_only && !is_pv && !node_in_check && depth <= 4
-            && !is_cap && !move_promo(moves[i])
-            && hist[move_from(moves[i])][move_to(moves[i])] < -1024 * depth)
+                  || (ptype_on(move_from(moves[i])) == PAWN
+                      && move_to(moves[i]) == ep_square);
+
+        /* PVS SEE PRUNING (captures)
+           Skip captures whose full exchange value is below a depth-scaled
+           threshold. Only applied once at least one legal move has been
+           searched (legal > 0) so we never prune the first move.
+           No make_move needed → no undo cost. */
+        if (!is_pv && !node_in_check && is_cap && !move_promo(moves[i])
+            && legal > 0
+            && piece_val[ptype_on(move_from(moves[i]))] > piece_val[ptype_on(move_to(moves[i]))]
+            && see(move_from(moves[i]), move_to(moves[i])) < -piece_val[PAWN] * depth)
             continue;
+
         make_move(moves[i]);
         if (is_illegal()) { undo_move(); continue; }
         legal++;
-        if (!is_cap) quiet++;
+        if (!is_cap && !move_promo(moves[i])) quiet++;
+
+        /* Cache whether this move gives check (opponent in check after make_move).
+           Used by both LMP and check extension -- compute once, reuse twice. */
+        int gives_check = history[ply - 1].in_check;
 
         /* LATE MOVE PRUNING (LMP)
-           At shallow depths, skip quiet moves beyond the first few.
-           The threshold scales with depth so we never prune at depth 1
-           (4*1+1=5 quiet moves allowed) through depth 3 (13 allowed).
-           Moves that give check are exempted: they may be the only defence. */
-        if (!caps_only && !is_pv && depth < 4 && quiet > 4 * depth + 1) {
-            if (!in_check(side)) { undo_move(); continue; }
+           At shallow depths on non-PV nodes, skip quiet moves beyond the first few.
+           Threshold: depth 1 allows 5, depth 2 allows 9, depth 3 allows 13.
+           Moves that give check are exempted: they may be the only defence.
+           Also skip entirely when the mover was in check (evasions must be fully searched). */
+        if (!is_pv && depth < 4 && !node_in_check && quiet > 4 * depth + 1
+            && !is_cap && !move_promo(moves[i])) {
+            if (!gives_check) { undo_move(); continue; }
         }
-        /* Push to quiet list only after LMP: only actually-searched quiets
-           should receive a history malus on beta cutoff. */
-        if (!is_cap) { quiet_moves[nquiet++] = moves[i]; }
 
+        /* Push to quiet list only after LMP so pruned moves don't get malus */
+        if (!is_cap && !move_promo(moves[i])) quiet_moves[nquiet++] = moves[i];
         /* CHECK EXTENSION: if the move gives check, extend by 1 ply.
            This ensures the engine never horizon-drops into QS while
-           the opponent is in check -- the resolution is searched fully.
-           Guard: only in main search (depth > 0), not inside QS. */
-        int ext = (!caps_only && in_check(side)) ? 1 : 0;
+           the opponent is in check -- the resolution is searched fully. */
+        int ext = gives_check ? 1 : 0;
 
         /* PRINCIPAL VARIATION SEARCH + LMR
-           First legal move searched with full window to establish the PV.
-           All subsequent moves use a null window (-alpha-1,-alpha) since
-           if our current best is truly best they should fail low cheaply.
-           The `sc < beta` upper-bound guard is omitted intentionally:
-           in modern PVS the re-search will simply fail-high and that score
-           is still valid (it is >= beta, which the parent will cut off anyway). */
-        if (caps_only || legal == 1) {
-            sc = -search(depth - 1 + ext, -beta, -alpha, 0, sply + 1);
+           First legal move: full window to establish the PV.
+           All others: null window first; late quiet moves also get
+           a depth reduction from lmr_table. Re-search at full depth
+           if the reduced score beats alpha. */
+        if (legal == 1) {
+            sc = -search(depth - 1 + ext, -beta, -alpha, sply + 1, 0);
         } else {
-            /* Adaptive LMR: late quiet moves are searched at a reduced depth
-               R drawn from lmr_table (log-scaled by depth and move number).
-               Any move whose reduced score beats alpha is re-searched at full
-               depth to get an exact score before updating alpha/best. */
-            int is_reduced = 0;
-            /* ext != 0 iff the move gives check -- reuse it to skip LMR
-               on checking moves without a second in_check() call. */
-            int d_clamped = depth < 32 ? depth : 31;
-            int m_clamped = legal < 64 ? legal : 63;
-            int lmr = (!is_cap && !move_promo(moves[i]) && !ext) ? lmr_table[d_clamped][m_clamped] : 0;
-            /* Increase reduction in non-PV nodes (they're expected to fail low anyway) */
-            if (!is_pv && lmr > 0) lmr++;
-            /* Never drop to depth 0 or below */
-            if (lmr > depth - 2) lmr = depth - 2;
-            if (lmr < 0) lmr = 0;
-            if (lmr > 0) {
-                /* reduced depth + null window */
-                sc = -search(depth - 1 + ext - lmr, -alpha - 1, -alpha, 0, sply + 1);
-                if (sc <= alpha) is_reduced = 1; /* failed low, skip re-search */
+            int lmr = 0;
+            /* Apply LMR only at depth >= 3 (enough remaining depth to be meaningful)
+               and after the 4th move (legal > 4) -- early moves are more likely
+               to be strong so we search them fully before reducing later ones.
+               Captures, promotions, and check-giving moves always get full depth. */
+            if (depth >= 3 && legal > 4 && !is_cap && !move_promo(moves[i]) && !ext) {
+                lmr = lmr_table[min(depth,31)][min(legal,63)];
+                if (lmr > depth - 2) lmr = depth - 2; /* always leave at least 1 ply */
+                if (lmr < 0) lmr = 0;
             }
-            if (!is_reduced) {
-                /* full depth + null window */
-                sc = -search(depth - 1 + ext, -alpha - 1, -alpha, 0, sply + 1);
-                /* full window only on PV nodes */
-                if (sc > alpha && is_pv)
-                    sc = -search(depth - 1 + ext, -beta, -alpha, 0, sply + 1);
-            }
+            /* Three-level search:
+               1. Reduced null window (LMR probe): fast refutation check.
+               2. Full-depth null window: if reduced score beat alpha, get an exact
+                  bound at the proper depth (cheap if move is truly bad).
+               3. Full window on PV nodes only: if the score still exceeds alpha
+                  here, this move is a new PV candidate and needs an exact score. */
+            sc = -search(depth - 1 + ext - lmr, -alpha - 1, -alpha, sply + 1, 0);
+            if (sc > alpha && lmr > 0)
+                sc = -search(depth - 1 + ext, -alpha - 1, -alpha, sply + 1, 0);
+            if (sc > alpha && is_pv)
+                sc = -search(depth - 1 + ext, -beta, -alpha, sply + 1, 0);
         }
 
         undo_move();
@@ -1502,27 +1744,23 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         if (sc > best_sc) best_sc = sc;
         if (sc > alpha) {
             alpha = sc;
-            best = moves[i];              /* moved here -- only update when alpha raised */
+            best = moves[i];
             /* Triangular PV update: store this move, then copy the child
                ply's continuation into the current row of the table. */
             if (!time_over_flag && moves[i] != 0) {
                 pv[sply][sply] = moves[i];
-                /* Triangular PV update: copy child continuation into current row */
                 for (int k_ = sply + 1; k_ < pv_length[sply + 1]; k_++) pv[sply][k_] = pv[sply + 1][k_];
                 pv_length[sply] = pv_length[sply + 1];
                 if (sply == 0) { best_root_move = moves[i]; print_result(best_sc); }
             }
         }
         if (alpha >= beta) {
-            if (!is_cap && !move_promo(moves[i])) {   /* quiet cutoff move */
+            if (!is_cap && !move_promo(moves[i])) {
                 int d = (sply < MAX_PLY) ? sply : MAX_PLY - 1;
-                int bonus = depth * depth;
                 killers[d][1] = killers[d][0]; killers[d][0] = moves[i];
-                /* History BONUS: reward the cutoff move.
-                   History MALUS: penalise every quiet move tried before it.
-                   Both use the gravity formula: base update +/- bonus, then
-                   subtract a fraction of the current value (diminishing returns)
-                   so entries self-correct instead of saturating at ±16000. */
+                /* History BONUS for the cutoff move, MALUS for quiets tried before it.
+                   Gravity formula: self-corrects instead of saturating at ±16000. */
+                int bonus = depth * depth;
                 int h = hist[move_from(moves[i])][move_to(moves[i])];
                 h += bonus - h * bonus / 16000;
                 hist[move_from(moves[i])][move_to(moves[i])] = h > 16000 ? 16000 : h;
@@ -1536,9 +1774,10 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
         }
     }
 
-    /* Checkmate or stalemate (only detectable in full search, not QS) */
-    if (!caps_only && !legal)
-        return in_check(side) ? -(MATE - sply) : 0;
+    /* Checkmate or stalemate: no legal moves found after full generation.
+       MATE - sply encodes distance-to-mate so shorter mates score higher.
+       Stalemate returns 0 (draw). */
+    if (!legal) return node_in_check ? -(MATE - sply) : 0;
 
     /* TT store: skip if search was aborted mid-tree (score is meaningless) */
     if (!time_over_flag && (e->key != hash_key || depth >= (int)tt_depth(e))) {
@@ -1578,65 +1817,54 @@ int search(int depth, int alpha, int beta, int was_null, int sply) {
 */
 
 void search_root(int max_depth) {
-    int sc = 0, prev_score = 0;   /* score from the last completed iteration */
+    int sc = 0, prev_sc = 0;
     time_over_flag = 0; best_root_move = 0; t_start = clock();
-    /* Init search */
     memset(hist, 0, sizeof(hist)); memset(killers, 0, sizeof(killers));
     memset(pv, 0, sizeof(pv)); memset(pv_length, 0, sizeof(pv_length));
     nodes_searched = 0;
     root_ply = ply;   /* anchor sply=0 at the search root */
 
     for (root_depth = 1; root_depth <= max_depth; root_depth++) {
-        int alpha = -INF, beta = INF;
-
-        /* Use a fixed aspiration window around the previous iteration's
-           score from depth 5 onward. */
-        if (root_depth >= 5) {
-            alpha = prev_score - 50;
-            beta = prev_score + 50;
-        }
-
-        sc = search(root_depth, alpha, beta, 0, 0);
-
-        /* If the narrow window failed low/high, redo once with a full window. */
-        if (!time_over_flag && root_depth >= 5 && (sc <= alpha || sc >= beta))
+        if (root_depth < 5) {
+            /* Full window for early depths: score too volatile for a narrow window. */
             sc = search(root_depth, -INF, INF, 0, 0);
-
+        } else {
+            /* ASPIRATION WINDOWS
+               Initial delta scales with score magnitude: unbalanced positions
+               (large |prev_sc|) are more volatile so they get a wider window.
+               On fail-low: collapse beta to the midpoint before widening alpha,
+               avoiding a needlessly large window on the high side.
+               On fail-high: widen beta only.
+               Proportional widening (delta += delta/2) is smoother than doubling. */
+            int delta = 15 + prev_sc * prev_sc / 16384;
+            int alpha = max(prev_sc - delta, -INF);
+            int beta  = min(prev_sc + delta,  INF);
+            while (1) {
+                sc = search(root_depth, alpha, beta, 0, 0);
+                if (time_over_flag) break;
+                if (sc <= alpha) {
+                    beta  = (alpha + beta) / 2; /* midpoint collapse */
+                    alpha = max(alpha - delta, -INF);
+                } else if (sc >= beta) {
+                    beta = min(beta + delta, INF);
+                } else {
+                    break;                      /* exact score within window */
+                }
+                delta += delta / 2;             /* proportional widening */
+            }
+        }
         if (time_over_flag) break;
+        prev_sc = sc;
 
-        prev_score = sc;
-
-        /* PV REPETITION TRUNCATION
-           Walk the PV and truncate at the first move that leads to a position
-           already seen in game history (would be a draw by repetition on the
-           real board). The search scores such lines correctly as 0 internally
-           but the PV table can still carry the moves, causing GUI warnings.  */
-
-           /* Commented because it's just a display issue and this is kept as reference,
-           eats alot of lines of code which is exactly the kind of thing we want to avoid in this codebase.
-
-           {
-               int pv_i;
-               for (pv_i = 0; pv_i < pv_length[0]; pv_i++) {
-                   make_move(pv[0][pv_i]);
-                   int seen = 0;
-                   for (int j = ply - 2; j >= 0 && j >= ply - halfmove_clock; j -= 2)
-                       if (history[j].hash_prev == hash_key) { seen = 1; break; }
-                   if (seen) { undo_move(); pv_length[0] = pv_i; break; }
-               }
-               for (int j = pv_i - 1; j >= 0; j--) { (void)j; undo_move(); }
-           }
-
-           print_result(sc); */
-
-           /* TIME CONTROL: stop iterating if we have used our budget.
-              We check AFTER a depth completes, never mid-search, so
-              the move we return is always from a fully searched depth. */
+        /* TIME CONTROL: stop iterating if we have used our budget.
+           We check AFTER a depth completes, never mid-search, so
+           the move we return is always from a fully searched depth. */
         {
             int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
             if (time_budget_ms > 0 && ms >= time_budget_ms / 2) break;
         }
     }
+    (void)sc;
 
     printf("bestmove ");
     if (best_root_move) print_move(best_root_move);
@@ -1725,14 +1953,10 @@ void uci_loop(void) {
     while (fgets(line, sizeof(line), stdin)) {
         if (!strncmp(line, "ucinewgame", 10)) {
             memset(tt, 0, (size_t)tt_size * sizeof(TTEntry)); memset(hist, 0, sizeof(hist));
-            parse_fen(STARTPOS);
-            hash_key = generate_hash();
+            parse_fen(STARTPOS); hash_key = generate_hash();
         }
         else if (!strncmp(line, "uci", 3)) {
-            printf("id name Chal " CHAL_VERSION "\nid author Naman Thanki\n");
-            printf("option name Hash type spin default 16 min 1 max 4096\n");
-            printf("uciok\n");
-            fflush(stdout);
+            puts("id name Chal " CHAL_VERSION "\nid author Naman Thanki\noption name Hash type spin default 16 min 1 max 4096\nuciok"); fflush(stdout);
         }
         else if (!strncmp(line, "setoption", 9)) {
             /* setoption name Hash value <N>  (N in megabytes) */
@@ -1744,15 +1968,10 @@ void uci_loop(void) {
                 if (new_tt) { free(tt); tt = new_tt; tt_size = new_size; }
             }
         }
-        else if (!strncmp(line, "isready", 7)) {
-            printf("readyok\n"); fflush(stdout);
-        }
+        else if (!strncmp(line, "isready", 7)) { printf("readyok\n"); fflush(stdout); }
         else if (!strncmp(line, "perft", 5)) {
-            int depth = 4; int64_t n;
-            sscanf(line, "perft %d", &depth);
-            n = perft(depth);
-            printf("perft depth %d nodes %" PRId64 "\n", depth, n);
-            fflush(stdout);
+            int depth = 4; sscanf(line, "perft %d", &depth);
+            printf("perft depth %d nodes %" PRId64 "\n", depth, perft(depth)); fflush(stdout);
         }
         else if (!strncmp(line, "position", 8)) {
             if (strlen(line) <= 9) continue;
@@ -1801,7 +2020,7 @@ void uci_loop(void) {
 
                    budget = our_time / movestogo + our_increment
 
-               If movestogo is not given we assume 30 moves remain --
+               If movestogo is not given we assume 20 moves remain --
                a safe estimate for sudden-death and increment games.
                search_root() iterates deeper until it has consumed more
                than half the budget for a single depth (at which point
@@ -1809,7 +2028,7 @@ void uci_loop(void) {
                returns the best move from the last fully searched depth. */
 
             int  depth = MAX_PLY;
-            int64_t wtime = 0, btime = 0, movestogo = 30, winc = 0, binc = 0;
+            int64_t wtime = 0, btime = 0, movestogo = 20, winc = 0, binc = 0;
 
             getval(line, "depth", "%d", &depth);
             getval(line, "wtime", "%" SCNd64, &wtime);
@@ -1821,7 +2040,7 @@ void uci_loop(void) {
             if (wtime || btime) {
                 int64_t our_time = (side == WHITE) ? wtime : btime;
                 int64_t our_inc = (side == WHITE) ? winc : binc;
-                if (movestogo <= 0) movestogo = 30;
+                if (movestogo <= 0) movestogo = 20;
                 time_budget_ms = (our_time / movestogo) + (our_inc * 3 / 4);
                 if (time_budget_ms > our_time - 50) time_budget_ms = our_time - 50;
                 if (time_budget_ms < 5) time_budget_ms = 5;
@@ -1831,9 +2050,7 @@ void uci_loop(void) {
             }
             search_root(depth);
         }
-        else if (!strncmp(line, "quit", 4)) {
-            break;
-        }
+        else if (!strncmp(line, "quit", 4)) break;
     }
     free(tt);
 }
@@ -1844,6 +2061,7 @@ void uci_loop(void) {
 
 int main(void) {
     setbuf(stdout, NULL);
+    memset(see_cleared, 0, sizeof(see_cleared));
     init_zobrist();
     init_lmr();
     parse_fen(STARTPOS);

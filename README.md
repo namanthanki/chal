@@ -4,6 +4,13 @@
 
 The name is Gujarati for "move." The goal is not to be the strongest engine, but the most readable one. Every subsystem such as move generation, search, evaluation, UCI fits in a single scroll. The source is written to be studied.
 
+## Ratings
+
+| Version    | CCRL 40/15 | CCRL Blitz |
+|------------|------------|------------|
+| Chal 1.3.0 | —          | 2283       |
+| Chal 1.3.2 | 2505       | 2465       |
+
 ## What "complete" means here
 
 A lot of minimal engines cut corners: no en passant, no underpromotion, bugged castling after a rook is captured, draw detection that breaks perpetual-check defence. Chal doesn't. It passes all five standard perft positions and handles:

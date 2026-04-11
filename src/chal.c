@@ -1554,17 +1554,6 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
 
         /* 50-move rule */
         if (halfmove_clock >= 100) return 0;
-
-        /* INSUFFICIENT MATERIAL
-           Only trigger when there is exactly one minor piece on the board total
-           (KNK or KBK). With one minor per side the corner-checkmate edge case
-           means we cannot safely claim a draw. */
-        {
-            int wm = count[WHITE][KNIGHT]+count[WHITE][BISHOP], bm = count[BLACK][KNIGHT]+count[BLACK][BISHOP];
-            if (wm+bm==1 && !count[WHITE][PAWN] && !count[BLACK][PAWN]
-                && !count[WHITE][ROOK] && !count[BLACK][ROOK] && !count[WHITE][QUEEN] && !count[BLACK][QUEEN])
-                return 0;
-        }
     }
 
     /* TT probe: always extract hash_move for ordering */

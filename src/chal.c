@@ -173,7 +173,7 @@ typedef struct {
 State history[1024];
 
 enum { MAX_PLY = 64 };
-Move killers[MAX_PLY][2];
+Move killers[MAX_PLY];
 
 /* ---------------------------------------------------------------
    PRINCIPAL VARIATION TABLE
@@ -1146,9 +1146,8 @@ int evaluate(void) {
    1. Hash move      (30000):  TT best move from a prior search.
    2. MVV-LVA        (20000+): 20000 + 10*cap_val - atk_val.
    3. Promotion      (19999):  Queen underpromotion.
-   4. Killer slot 0  (19998):  Most recent quiet beta-cutoff at this ply.
-   5. Killer slot 1  (19997):  Older quiet beta-cutoff at this ply.
-   6. History   (-16000..16000): Bonus/malus from beta-cutoff tracking.
+   4. Killer       (19998):  Most recent quiet beta-cutoff at this ply.
+   5. History   (-16000..16000): Bonus/malus from beta-cutoff tracking.
       Negative scores are intentional: they push failing moves to the bottom
       of the ordering without ever skipping them entirely.
 */
@@ -1179,8 +1178,7 @@ static inline int score_move(Move m, Move hash_move, int sply) {
             sc = 20000 + 10 * piece_val[prey_type] - piece_val[hunter_type];
     }
     else if (move_promo(m)) sc = 19999;
-    else if (sply < MAX_PLY && m == killers[sply][0]) sc = 19998;
-    else if (sply < MAX_PLY && m == killers[sply][1]) sc = 19997;
+    else if (sply < MAX_PLY && m == killers[sply]) sc = 19998;
     else                    sc = hist[fr][to];  /* [-16000, 16000] */
     return sc;
 }
@@ -1423,69 +1421,8 @@ static inline int is_bad_capture(int from, int to) {
     return see(from, to) < 0;
 }
 
-static int qsearch(int alpha, int beta, int sply) {
-    Move moves[256]; int best_sc, sc;
-
-    pv_length[sply] = sply;
-
-    /* Time check -- same cadence as main search */
-    if ((nodes_searched & 1023) == 0 && time_budget_ms > 0) {
-        int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
-        if (ms >= time_budget_ms) { time_over_flag = 1; return 0; }
-    }
-    if (time_over_flag) return 0;
-
-    /* Stand-pat: static eval as lower bound (we can always stop capturing) */
-    best_sc = evaluate();
-    if (best_sc >= beta) return best_sc;
-    if (best_sc > alpha) alpha = best_sc;
-
-    nodes_searched++;
-
-    int cnt = generate_captures(moves);
-    int scores[256];
-    score_moves(moves, scores, cnt, 0, sply);
-
-    for (int i = 0; i < cnt; i++) {
-        pick_move(moves, scores, cnt, i);
-
-        /* DELTA PRUNING: skip if even the captured piece + margin cannot raise alpha */
-        int dp_cap = piece_on(move_to(moves[i]));
-        int dp_ep  = (!dp_cap && ptype_on(move_from(moves[i])) == PAWN
-                      && move_to(moves[i]) == ep_square);
-        if (dp_cap || dp_ep) {
-            int cap_val = dp_cap ? piece_val[piece_type(dp_cap)] : piece_val[PAWN];
-            if (best_sc + cap_val + 200 < alpha) continue;
-        }
-
-        /* QS SEE PRUNING: skip captures that lose material in the full exchange.
-           Promotions are always searched (large material swing).
-           En passant returns SEE == 0 (ptype_on(to) == 0) so is kept. */
-        if (!move_promo(moves[i]) && is_bad_capture(move_from(moves[i]), move_to(moves[i])))
-            continue;
-
-        make_move(moves[i]);
-        if (is_illegal()) { undo_move(); continue; }
-
-        sc = -qsearch(-beta, -alpha, sply + 1);
-        undo_move();
-
-        if (sc > best_sc) best_sc = sc;
-        if (sc > alpha) {
-            alpha = sc;
-            if (!time_over_flag && moves[i] != 0) {
-                pv[sply][sply] = moves[i];
-                for (int k_ = sply + 1; k_ < pv_length[sply + 1]; k_++) pv[sply][k_] = pv[sply + 1][k_];
-                pv_length[sply] = pv_length[sply + 1];
-            }
-        }
-        if (alpha >= beta) break;
-    }
-    return best_sc;
-}
-
 /* ---------------------------------------------------------------
-   search  -- negamax alpha-beta with TT, PVS, and killers
+   search  -- negamax alpha-beta with TT, PVS, killers, and embedded qsearch
    ---------------------------------------------------------------
    Negamax: the score for the side to move equals the negation of
    the best score the opponent achieves.  One recursive function
@@ -1504,11 +1441,21 @@ static int qsearch(int alpha, int beta, int sply) {
 
    Check extension: if the move gives check, extend by 1 ply so the
    engine never horizon-drops while the opponent is in check.
+
+   Quiescence is embedded here rather than a separate function: at
+   depth 0 the horizon effect can cause tactical blindness, so the
+   search continues with captures only until the position is quiet.
+   When depth <= 0 we set in_qsearch and skip everything that only
+   applies to the main search (TT probe, repetition, NMP, RFP,
+   razoring, IIR, LMP, LMR, killers, history, TT store, mate/stale
+   detection); movegen switches to captures-only; best_sc starts at
+   the static eval (stand-pat lower bound) instead of -INF.
 --------------------------------------------------------------- */
 int search(int depth, int alpha, int beta, int sply, int was_null) {
     Move moves[256], best = 0, hash_move = 0;
     int legal = 0, best_sc, old_alpha = alpha, sc;
     int is_pv = (beta - alpha > 1); /* PV node: wide window, not a null-window probe */
+    int in_qsearch = depth <= 0;
     TTEntry* e = &tt[hash_key % (HASH)tt_size];
 
     /* Clear PV at this ply before any early returns (TT hits, repetition).
@@ -1525,9 +1472,6 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
     }
     if (time_over_flag) return 0;
 
-    /* Drop into quiescence search at the horizon */
-    if (depth <= 0) return qsearch(alpha, beta, sply);
-
     /* REPETITION DETECTION
        Two rules apply, depending on whether the repeated position is inside
        the current search tree or in the game history before the search root.
@@ -1543,8 +1487,11 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
        The halfmove_clock bound is exact: no repetition can cross an
        irreversible move (pawn advance or capture), so we need not look
        further back than ply - halfmove_clock. We step by 2 because
-       repetitions require the same side to move. */
-    if (ply > root_ply) {
+       repetitions require the same side to move.
+
+       Skipped in qsearch: transposed qsearch hits on a repeated position
+       are rare and the stand-pat bound is still correct. */
+    if (!in_qsearch && ply > root_ply) {
         /* Repetition detection */
         for (int i = ply - 2; i >= root_ply; i -= 2)
             if (history[i].hash_prev == hash_key) return 0;
@@ -1554,74 +1501,78 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
 
         /* 50-move rule */
         if (halfmove_clock >= 100) return 0;
-
-        /* INSUFFICIENT MATERIAL
-           Only trigger when there is exactly one minor piece on the board total
-           (KNK or KBK). With one minor per side the corner-checkmate edge case
-           means we cannot safely claim a draw. */
-        {
-            int wm = count[WHITE][KNIGHT]+count[WHITE][BISHOP], bm = count[BLACK][KNIGHT]+count[BLACK][BISHOP];
-            if (wm+bm==1 && !count[WHITE][PAWN] && !count[BLACK][PAWN]
-                && !count[WHITE][ROOK] && !count[BLACK][ROOK] && !count[WHITE][QUEEN] && !count[BLACK][QUEEN])
-                return 0;
-        }
     }
 
-    /* TT probe: always extract hash_move for ordering */
-    if (e->key == hash_key) {
+    /* TT probe: always extract hash_move for ordering.
+       Mate scores are stored relative to the node that proved them
+       (+sply on write) so the same position compares correctly when
+       retrieved via a transposition at a different search depth.
+       Reverse that shift before using the score here.
+       Qsearch skips the probe entirely -- leaf-heavy qsearch trees
+       would thrash the TT for negligible benefit. */
+    if (!in_qsearch && e->key == hash_key) {
         hash_move = e->best_move;
         if ((int)tt_depth(e) >= depth) {
             int flag = tt_flag(e);
-            /* Mate scores are stored relative to the node that proved them
-               (+sply on write) so the same position compares correctly when
-               retrieved via a transposition at a different search depth.
-               Reverse that shift before using the score here.            */
             int tt_sc = e->score;
             if (tt_sc > MATE - MAX_PLY) tt_sc -= sply;
             if (tt_sc < -(MATE - MAX_PLY)) tt_sc += sply;
             if (sply > 0) {
-                if (flag == TT_EXACT)                            return tt_sc;
-                if (!is_pv && flag == TT_BETA && tt_sc >= beta) return tt_sc;
+                if (flag == TT_EXACT)                             return tt_sc;
+                if (!is_pv && flag == TT_BETA  && tt_sc >= beta)  return tt_sc;
                 if (!is_pv && flag == TT_ALPHA && tt_sc <= alpha) return tt_sc;
             }
         }
     }
 
-    best_sc = -INF;
+    /* STAND-PAT (qsearch only)
+       The side to move can always decline further captures, so we
+       initialise best_sc = static eval.  If that already exceeds beta
+       we prune immediately (standing pat is good enough).
+       The main search instead starts at -INF and relies on move search
+       to raise best_sc. */
+    if (in_qsearch) {
+        best_sc = evaluate();
+        if (best_sc >= beta) return best_sc;
+        if (best_sc > alpha) alpha = best_sc;
+    } else {
+        best_sc = -INF;
+    }
+
     nodes_searched++;
 
     /* Cache whether the side to move is currently in check.
        RFP, NMP, and IIR all guard on this -- compute once, reuse three times. */
     int node_in_check = (sply > 0) ? history[ply - 1].in_check : in_check(side);
 
-    /* REVERSE FUTILITY PRUNING (RFP)
-       If static eval is already well above beta at shallow depth, the
-       position is unlikely to become worse after a quiet move -- prune
-       immediately. Zero nodes spent per pruned node.
-       Guards: not at root (sply>0), not in check, not a mate score. */
     /* Compute static eval once; shared by RFP, razoring, and NMP guard below.
-       Skipped entirely when in check (no pruning applies). */
-    int static_eval = (!is_pv && sply > 0 && !node_in_check && beta < MATE - MAX_PLY && depth <= 7)
+       Skipped entirely when in check (no pruning applies) and in qsearch
+       (best_sc already holds the stand-pat eval). */
+    int static_eval = (!in_qsearch && !is_pv && sply > 0 && !node_in_check && beta < MATE - MAX_PLY && depth <= 7)
                       ? evaluate() : -INF;
 
     if (static_eval != -INF) {
-        /* REVERSE FUTILITY PRUNING (RFP) */
+        /* REVERSE FUTILITY PRUNING (RFP)
+           If static eval is already well above beta at shallow depth, the
+           position is unlikely to become worse after a quiet move -- prune
+           immediately. Zero nodes spent per pruned node. */
         if (depth <= 7 && static_eval - 70 * depth >= beta)
             return static_eval - 70 * depth;
         /* RAZORING: if eval is far below alpha even after the best capture,
-           there is no point searching -- drop straight into qsearch. */
+           there is no point searching -- drop straight into embedded qsearch
+           via a self-recursion at depth 0. */
         if (depth <= 3 && static_eval + 300 + 60 * depth < alpha)
-            return qsearch(alpha, beta, sply);
+            return search(0, alpha, beta, sply, 0);
     }
 
     /* NULL MOVE PRUNING (NMP)
        Guard: static_eval >= beta ensures we're not in a losing position --
        passing the turn when already losing is pointless and wastes a search.
        R=3 normally, R=4 at depth >= 7.
-       Guards: not a PV node, no consecutive null moves (was_null),
-       not in check, and the side to move has non-pawn material
+       Guards: not in qsearch, not a PV node, no consecutive null moves
+       (was_null), not in check, and the side to move has non-pawn material
        (zugzwang guard -- in pure pawn endings passing is often worst). */
-    if (!is_pv && sply > 0 && depth >= 3 && !was_null
+    if (!in_qsearch && !is_pv && sply > 0 && depth >= 3 && !was_null
         && !node_in_check && beta < MATE - MAX_PLY
         && (count[side][KNIGHT] + count[side][BISHOP]
             + count[side][ROOK]  + count[side][QUEEN] > 0)) {
@@ -1650,10 +1601,12 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
        Reduce depth by 1 to avoid spending too much time on a badly-ordered
        node; the resulting TT entry will guide a future full-depth search.
        Guards: depth >= 4 so we don't reduce already-shallow nodes;
-       not in check -- evasions must be searched at full depth. */
-    if (depth >= 4 && !hash_move && !node_in_check) depth--;
+       not in check -- evasions must be searched at full depth;
+       not in qsearch -- depth is already <= 0 there. */
+    if (!in_qsearch && depth >= 4 && !hash_move && !node_in_check) depth--;
 
-    int cnt = generate_moves(moves, 0);
+    /* Move generation: captures only in qsearch, everything in main search. */
+    int cnt = in_qsearch ? generate_captures(moves) : generate_moves(moves, 0);
     int scores[256];
     score_moves(moves, scores, cnt, hash_move, sply);
     /* quiet_moves tracks searched quiet moves in order so the history malus
@@ -1670,16 +1623,32 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
                   || (ptype_on(move_from(moves[i])) == PAWN
                       && move_to(moves[i]) == ep_square);
 
-        /* PVS SEE PRUNING (captures)
-           Skip captures whose full exchange value is below a depth-scaled
-           threshold. Only applied once at least one legal move has been
-           searched (legal > 0) so we never prune the first move.
-           No make_move needed → no undo cost. */
-        if (!is_pv && !node_in_check && is_cap && !move_promo(moves[i])
-            && legal > 0
-            && piece_val[ptype_on(move_from(moves[i]))] > piece_val[ptype_on(move_to(moves[i]))]
-            && see(move_from(moves[i]), move_to(moves[i])) < -piece_val[PAWN] * depth)
+        if (in_qsearch) {
+            /* DELTA PRUNING: if even capturing the most valuable piece on the
+               board plus a safety margin cannot raise alpha, skip the subtree
+               entirely -- no capture can possibly help. Promotions without
+               capture have no delta gate. EP treated as a pawn capture. */
+            int to_pc = piece_on(move_to(moves[i]));
+            if (is_cap) {
+                int cap_val = to_pc ? piece_val[piece_type(to_pc)] : piece_val[PAWN];
+                if (best_sc + cap_val + 200 < alpha) continue;
+            }
+            /* QS SEE PRUNING: skip captures that lose material in the full exchange.
+               Promotions are always searched (large material swing).
+               En passant returns SEE == 0 (ptype_on(to) == 0) so is kept. */
+            if (!move_promo(moves[i]) && is_bad_capture(move_from(moves[i]), move_to(moves[i])))
+                continue;
+        } else if (!is_pv && !node_in_check && is_cap && !move_promo(moves[i])
+                   && legal > 0
+                   && piece_val[ptype_on(move_from(moves[i]))] > piece_val[ptype_on(move_to(moves[i]))]
+                   && see(move_from(moves[i]), move_to(moves[i])) < -piece_val[PAWN] * depth) {
+            /* PVS SEE PRUNING (captures)
+               Skip captures whose full exchange value is below a depth-scaled
+               threshold. Only applied once at least one legal move has been
+               searched (legal > 0) so we never prune the first move.
+               No make_move needed -> no undo cost. */
             continue;
+        }
 
         make_move(moves[i]);
         if (is_illegal()) { undo_move(); continue; }
@@ -1694,25 +1663,31 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
            At shallow depths on non-PV nodes, skip quiet moves beyond the first few.
            Threshold: depth 1 allows 5, depth 2 allows 9, depth 3 allows 13.
            Moves that give check are exempted: they may be the only defence.
-           Also skip entirely when the mover was in check (evasions must be fully searched). */
-        if (!is_pv && depth < 4 && !node_in_check && quiet > 4 * depth + 1
-            && !is_cap && !move_promo(moves[i])) {
-            if (!gives_check) { undo_move(); continue; }
+           Also skip entirely when the mover was in check (evasions must be fully
+           searched) or when in qsearch (no quiets to prune). */
+        if (!in_qsearch && !is_pv && depth < 4 && !node_in_check && quiet > 4 * depth + 1
+            && !is_cap && !move_promo(moves[i]) && !gives_check) {
+            undo_move(); continue;
         }
 
         /* Push to quiet list only after LMP so pruned moves don't get malus */
-        if (!is_cap && !move_promo(moves[i])) quiet_moves[nquiet++] = moves[i];
+        if (!in_qsearch && !is_cap && !move_promo(moves[i])) quiet_moves[nquiet++] = moves[i];
         /* CHECK EXTENSION: if the move gives check, extend by 1 ply.
-           This ensures the engine never horizon-drops into QS while
-           the opponent is in check -- the resolution is searched fully. */
-        int ext = gives_check ? 1 : 0;
+           This ensures the engine never horizon-drops into qsearch while
+           the opponent is in check -- the resolution is searched fully.
+           No extension in qsearch (we are already past the horizon). */
+        int ext = (!in_qsearch && gives_check) ? 1 : 0;
 
         /* PRINCIPAL VARIATION SEARCH + LMR
            First legal move: full window to establish the PV.
            All others: null window first; late quiet moves also get
            a depth reduction from lmr_table. Re-search at full depth
-           if the reduced score beats alpha. */
-        if (legal == 1) {
+           if the reduced score beats alpha.
+           In qsearch we just recurse with depth-1 (which stays <= 0),
+           so the whole PVS/LMR ladder collapses to a simple call. */
+        if (in_qsearch) {
+            sc = -search(depth - 1, -beta, -alpha, sply + 1, 0);
+        } else if (legal == 1) {
             sc = -search(depth - 1 + ext, -beta, -alpha, sply + 1, 0);
         } else {
             int lmr = 0;
@@ -1745,20 +1720,22 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
             alpha = sc;
             best = moves[i];
             /* Triangular PV update: store this move, then copy the child
-               ply's continuation into the current row of the table. */
+               ply's continuation into the current row of the table.
+               Only the main search prints root PVs -- qsearch stays quiet. */
             if (!time_over_flag && moves[i] != 0) {
                 pv[sply][sply] = moves[i];
                 for (int k_ = sply + 1; k_ < pv_length[sply + 1]; k_++) pv[sply][k_] = pv[sply + 1][k_];
                 pv_length[sply] = pv_length[sply + 1];
-                if (sply == 0) { best_root_move = moves[i]; print_result(best_sc); }
+                if (!in_qsearch && sply == 0) { best_root_move = moves[i]; print_result(best_sc); }
             }
         }
         if (alpha >= beta) {
-            if (!is_cap && !move_promo(moves[i])) {
+            /* Killers / history only tracked in the main search. */
+            if (!in_qsearch && !is_cap && !move_promo(moves[i])) {
                 int d = (sply < MAX_PLY) ? sply : MAX_PLY - 1;
-                killers[d][1] = killers[d][0]; killers[d][0] = moves[i];
+                killers[d] = moves[i];
                 /* History BONUS for the cutoff move, MALUS for quiets tried before it.
-                   Gravity formula: self-corrects instead of saturating at ±16000. */
+                   Gravity formula: self-corrects instead of saturating at +/-16000. */
                 int bonus = depth * depth;
                 int h = hist[move_from(moves[i])][move_to(moves[i])];
                 h += bonus - h * bonus / 16000;
@@ -1775,11 +1752,13 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
 
     /* Checkmate or stalemate: no legal moves found after full generation.
        MATE - sply encodes distance-to-mate so shorter mates score higher.
-       Stalemate returns 0 (draw). */
-    if (!legal) return node_in_check ? -(MATE - sply) : 0;
+       Stalemate returns 0 (draw). Skipped in qsearch: zero legal captures
+       from a quiet position is normal and the stand-pat best_sc is correct. */
+    if (!in_qsearch && !legal) return node_in_check ? -(MATE - sply) : 0;
 
-    /* TT store: skip if search was aborted mid-tree (score is meaningless) */
-    if (!time_over_flag && (e->key != hash_key || depth >= (int)tt_depth(e))) {
+    /* TT store: skip if search was aborted mid-tree (score is meaningless)
+       and skip in qsearch (too many leaf nodes to usefully cache). */
+    if (!in_qsearch && !time_over_flag && (e->key != hash_key || depth >= (int)tt_depth(e))) {
         int flag = (best_sc <= old_alpha) ? TT_ALPHA :
             (best_sc >= beta) ? TT_BETA : TT_EXACT;
         /* Encode mate scores as distance-from-node (+sply) so the score

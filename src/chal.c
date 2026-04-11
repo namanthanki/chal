@@ -173,7 +173,7 @@ typedef struct {
 State history[1024];
 
 enum { MAX_PLY = 64 };
-Move killers[MAX_PLY][2];
+Move killers[MAX_PLY];
 
 /* ---------------------------------------------------------------
    PRINCIPAL VARIATION TABLE
@@ -1146,9 +1146,8 @@ int evaluate(void) {
    1. Hash move      (30000):  TT best move from a prior search.
    2. MVV-LVA        (20000+): 20000 + 10*cap_val - atk_val.
    3. Promotion      (19999):  Queen underpromotion.
-   4. Killer slot 0  (19998):  Most recent quiet beta-cutoff at this ply.
-   5. Killer slot 1  (19997):  Older quiet beta-cutoff at this ply.
-   6. History   (-16000..16000): Bonus/malus from beta-cutoff tracking.
+   4. Killer       (19998):  Most recent quiet beta-cutoff at this ply.
+   5. History   (-16000..16000): Bonus/malus from beta-cutoff tracking.
       Negative scores are intentional: they push failing moves to the bottom
       of the ordering without ever skipping them entirely.
 */
@@ -1179,8 +1178,7 @@ static inline int score_move(Move m, Move hash_move, int sply) {
             sc = 20000 + 10 * piece_val[prey_type] - piece_val[hunter_type];
     }
     else if (move_promo(m)) sc = 19999;
-    else if (sply < MAX_PLY && m == killers[sply][0]) sc = 19998;
-    else if (sply < MAX_PLY && m == killers[sply][1]) sc = 19997;
+    else if (sply < MAX_PLY && m == killers[sply]) sc = 19998;
     else                    sc = hist[fr][to];  /* [-16000, 16000] */
     return sc;
 }
@@ -1745,7 +1743,7 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
         if (alpha >= beta) {
             if (!is_cap && !move_promo(moves[i])) {
                 int d = (sply < MAX_PLY) ? sply : MAX_PLY - 1;
-                killers[d][1] = killers[d][0]; killers[d][0] = moves[i];
+                killers[d] = moves[i];
                 /* History BONUS for the cutoff move, MALUS for quiets tried before it.
                    Gravity formula: self-corrects instead of saturating at ±16000. */
                 int bonus = depth * depth;

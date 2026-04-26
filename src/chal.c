@@ -66,7 +66,7 @@
 #include <inttypes.h>
 #include <math.h>
 
-#define CHAL_VERSION "1.4.0"
+#define CHAL_VERSION "1.4.1"
 
 /* ===============================================================
    S1  CONSTANTS & TYPES

@@ -10,6 +10,7 @@ The name is Gujarati for "move." The goal is not to be the strongest engine, but
 |------------|------------|------------|
 | Chal 1.3.0 | —          | 2283       |
 | Chal 1.3.2 | 2505       | 2465       |
+| Chal 1.4.0 | 2718       | —          |
 
 ## What "complete" means here
 
@@ -86,7 +87,7 @@ All terms are from the side-to-move's perspective; midgame and endgame scores ar
 
 - **Tapered evaluation** -- separate MG and EG scores blended as `(mg*phase + eg*(24-phase)) / 24`, where phase counts remaining piece material (24 = opening, 0 = pure endgame).
 - **Material** -- Rofchade Texel-tuned values: MG P=82 N=337 B=365 R=477 Q=1025; EG P=94 N=281 B=297 R=513 Q=937.
-- **Piece-square tables** -- `mg_pst[6][64]` and `eg_pst[6][64]`, PeSTO tables.
+- **Piece-square tables** -- `mg_pst[6][64]` and `eg_pst[6][64]`, Tuned PeSTO tables.
 - **Pawn evaluation** -- passed pawn detection (no opposing pawn ahead on same or adjacent file), with rank-dependent bonuses enhanced by king distance in the endgame. Doubled pawns -20 cp, isolated pawns -10 cp (MG and EG).
 - **Mobility** -- pseudo-legal reachable squares above a per-piece centre target. Knights, bishops, rooks +/-3-4 cp/sq; queens +/-2 cp/sq; applied to both MG and EG.
 - **Bishop pair** -- +31 MG, +30 EG.
@@ -146,3 +147,5 @@ go wtime 60000 btime 60000 movestogo 40
 **Pawel Koziol** ([nescitus](https://github.com/nescitus)) -- for thorough testing, bug reports, and architectural guidance throughout development. His feedback directly shaped the killer-move ply-indexing fix, the NMP ply-bookkeeping refactor, the PeSTO evaluation upgrade, the lazy pick-move sort, the history malus formula in v1.3.1, and the pawn evaluation refinements, state structure refactoring, search clarity initiatives, piece list implementation, QS pruning improvements, and the `is_square_attacked` split with dedicated capture generator in v1.4.0.
 
 **Anik Patel** ([Bobingstern](https://github.com/Bobingstern)) -- for guiding the SPRT testing setup using [fastchess](https://github.com/Disservin/fastchess), making it possible to measure strength gains objectively across versions.
+
+**Gediminas Masaitis ([GediminasMasaitis](https://github.com/GediminasMasaitis)) -- for tuning the entire eval which results in 30+ ELO performance! it's not part of 1.4.0, but will be released soon.

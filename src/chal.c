@@ -1064,10 +1064,8 @@ int evaluate(void) {
 
         if (pt == ROOK) {
             if (lowest_pawn_rank[color][f] == 7) {
-                if (lowest_pawn_rank[color ^ 1][f] == 7)
-                    add_score(mg, eg, color, 44, -3);
-                else
-                    add_score(mg, eg, color, 21, 6);
+                if (lowest_pawn_rank[color ^ 1][f] == 7)    add_score(mg, eg, color, 44, -3);
+                else    add_score(mg, eg, color, 21, 6);
             }
             continue;
         }

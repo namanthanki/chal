@@ -17,10 +17,10 @@ It’s not about strength. A constraint like this naturally limits performance. 
 
 | Version    | CCRL 40/15 | CCRL Blitz |
 |------------|------------|------------|
-| Chal 1.3.0 | —          | 2283       |
-| Chal 1.3.2 | 2505       | 2465       |
-| Chal 1.4.0 | 2718       | —          |
-| Chal 1.4.1 | _          | 2764       |
+| Chal 1.3.0 | —          | 2284       |
+| Chal 1.3.2 | 2505       | 2466       |
+| Chal 1.4.0 | 2713       | —          |
+| Chal 1.4.1 | 2756       | 2764       |
 
 ## What "complete" means here
 
@@ -152,4 +152,4 @@ go wtime 60000 btime 60000 movestogo 40
 
 **Anik Patel** ([Bobingstern](https://github.com/Bobingstern)) -- for guiding the SPRT testing setup using [fastchess](https://github.com/Disservin/fastchess), making it possible to measure strength gains objectively across versions.
 
-**Gediminas Masaitis ([GediminasMasaitis](https://github.com/GediminasMasaitis)) -- for tuning the entire eval which results in 30+ ELO performance! it's not part of 1.4.0, but will be released soon.
+**Gediminas Masaitis ([GediminasMasaitis](https://github.com/GediminasMasaitis)) -- for tuning the entire eval which results in ~40 ELO performance! it's not part of 1.4.0, but will be released soon.

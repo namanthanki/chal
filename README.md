@@ -1,4 +1,8 @@
+<div align="center">
+<img src="logo.png" alt="Chal logo" width="200"/>
+
 # Chal
+</div>
 
 **Chal** is a complete, FIDE-rules-compliant chess engine in **999 lines of C99**.  
 It follows FIDE rules, uses a single file, and has no dependencies.

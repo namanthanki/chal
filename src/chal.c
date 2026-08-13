@@ -1626,8 +1626,8 @@ int search(int depth, int alpha, int beta, int sply, int was_null) {
 
         if (static_eval == -INF) static_eval = evaluate();
 
-        if (static_eval >= beta) {
-            int R = depth >= 7 ? 4 : 3;
+        if (static_eval >= beta + 30) {
+            int R = 3 + depth / 4 + min(3, (static_eval - beta) / 200);
             int ep_prev = ep_square;
             hash_key ^= zobrist_side;
             if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];

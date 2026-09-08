@@ -2,7 +2,7 @@
 ================================================================
                           C H A L
 ================================================================
-   "Chal" is Gujarati for "move".
+   "Chal" is Gujarati for "move" or "tactic".
 
    Author : Naman Thanki
    Date   : 2026

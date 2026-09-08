@@ -2,2067 +2,1421 @@
 ================================================================
                           C H A L
 ================================================================
-   Gujarati for "move." A minimal chess engine in C99.
+   "Chal" is Gujarati for "move".
 
    Author : Naman Thanki
    Date   : 2026
 
-   This file is meant to be read as a book, not just run.
-   Every subsystem is a short lesson in engine design.
+   This program is written to be read from top to bottom, like a
+   short book on chess programming. It shows how bitboards, a
+   small neural network (NNUE), and an alpha-beta search fit
+   together in standard C without excess ceremony.
 
-   Compile:  gcc chal.c -O2 -Wall -Wextra -pedantic -std=c99 -o chal
+   Compile:  gcc -O3 -march=native -Wall -Wextra src/chal.c -o chal.exe
    Protocol: Universal Chess Interface (UCI)
 ================================================================
 
    TABLE OF CONTENTS
    -----------------
-   S1  Constants & Types         - pieces, moves, TT, PV, state
-   S2  Board State               - 0x88 grid, global telemetry
-   S3  Direction & Castling Data - geometric move vectors
-   S4  Zobrist Hashing           - position fingerprints
-   S5  Attack Detection          - sonar-ping ray scanning
-   S6  Make / Undo               - incremental board updates
-   S7  Move Generation           - unified move generation
-   S8  FEN Parser                - reading position strings
-   S9  Evaluation                - material, geometry, and structure
-   S10 Move Ordering             - MVV-LVA, killers, and history
-   S11 Search                    - qsearch, negamax alpha-beta, PVS
-   S12 Perft                     - correctness testing
-   S13 UCI Loop                  - GUI communication
-
-   ================================================================
-
-   NAMING CONVENTIONS
-   ------------------
-   fr, to    = from-square, to-square of a move
-   pt        = piece type  (PAWN..KING, integer 1-6)
-   p         = piece       (encoded as color<<3 | type)
-   c, color  = piece color (WHITE=0, BLACK=1)
-   sq        = board square (0x88 index, valid if !(sq & 0x88))
-   cap       = captured piece (0 if none)
-   pr        = promotion piece type (0 if none)
-   sply      = search ply from root (0 at root)
-   ply       = game ply (incremented by make_move)
-   depth     = remaining search depth (counts down to 0)
-   mg, eg    = midgame score, endgame score
-   ac        = attacking color (used in attack detection)
-
-   SQUARE HELPERS (prefer these over raw board[] access)
-   ------------------------------------------------------
-   piece_on(sq)        -> board[sq]          (safe on any square)
-   is_empty(sq)        -> board[sq] == EMPTY (safe on any square)
-   piece_is(sq, c, t)  -> board[sq] == make_piece(c, t) (safe on any square)
-   ptype_on(sq)        -> piece type         (call only on non-empty square)
-   color_on(sq)        -> piece color        (call only on non-empty square)
-
+   S1  Constants & Types       Bitboards, square indices, and moves
+   S2  Attacks & Magic Tables  Leapers, rays, and slider lookups
+   S3  Zobrist Hashing & TT    Position fingerprints and hash table
+   S4  NNUE Evaluation         Accumulator updates and forward pass
+   S5  Board Representation    Bitboards, mailbox, and make/undo
+   S6  Move Generation         Pseudo-legal move generator
+   S7  Search & Heuristics     Alpha-beta, quiescence, and pruning
+   S8  UCI & Benchmarks        Command loop, perft, and benchmark
+================================================================
 */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
-#include <stdint.h>
-#include <inttypes.h>
 #include <math.h>
 
-#define CHAL_VERSION "1.4.1"
+#define CHAL_VERSION "2.0.0"
 
-/* ===============================================================
+/* ================================================================
    S1  CONSTANTS & TYPES
-   ===============================================================
+   ================================================================
 
-   PIECE ENCODING
-   --------------
-   One byte per piece.  Bit 3 = colour (0=White, 1=Black).
-   Bits 2..0 = type (1=Pawn .. 6=King, 0=Empty).
+   A chessboard has 64 squares. A 64-bit integer has 64 bits. A
+   "bitboard" represents any set of squares (for example, all white
+   pawns) as a single uint64_t where bit N is 1 if square N is in
+   the set.
 
-       make_piece(c,t)  ->  (c<<3)|t
-       piece_type(p)    ->  p & 7
-       piece_color(p)   ->  p >> 3
+   Squares are numbered 0 to 63 from a1 to h8 (rank * 8 + file):
+
+     8 | 56 57 58 59 60 61 62 63
+     7 | 48 49 50 51 52 53 54 55
+     6 | 40 41 42 43 44 45 46 47
+     5 | 32 33 34 35 36 37 38 39
+     4 | 24 25 26 27 28 29 30 31
+     3 | 16 17 18 19 20 21 22 23
+     2 |  8  9 10 11 12 13 14 15
+     1 |  0  1  2  3  4  5  6  7
+       +------------------------
+          a  b  c  d  e  f  g  h
+
+   Basic bit operations:
+     bit(sq)        1ULL << sq
+     popcount(bb)   number of set bits
+     lsb(bb)        index of the least significant set bit (0..63)
+     pop_lsb(&bb)   return lowest set bit, then clear it (bb &= bb - 1)
 */
 
-enum { EMPTY = 0, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING };
-enum { WHITE = 0, BLACK = 1 };
-enum { SQ_NONE = -1 };
-static inline int piece_type(int p) { return p & 7; }
-static inline int piece_color(int p) { return p >> 3; }
-static inline int make_piece(int c, int t) { return (c << 3) | t; }
-enum { INF = 50000, MATE = 30000 };
-const int WP = 1, BP = 9;
+typedef uint64_t u64;
+typedef uint16_t Move;
 
-// globals for see
-short see_cleared[128];
-short see_sentinel = 1;
+enum { PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING, NO_PIECE, WHITE = 0, BLACK = 1, BOTH = 2 };
+enum { A1,B1,C1,D1,E1,F1,G1,H1, A2,B2,C2,D2,E2,F2,G2,H2, A3,B3,C3,D3,E3,F3,G3,H3, A4,B4,C4,D4,E4,F4,G4,H4, A5,B5,C5,D5,E5,F5,G5,H5, A6,B6,C6,D6,E6,F6,G6,H6, A7,B7,C7,D7,E7,F7,G7,H7, A8,B8,C8,D8,E8,F8,G8,H8, SQ_NONE };
+enum { CASTLE_WK = 1, CASTLE_WQ = 2, CASTLE_BK = 4, CASTLE_BQ = 8, FLAG_QUIET = 0, FLAG_DOUBLE_PUSH, FLAG_CASTLE, FLAG_EP, FLAG_PROMO_N, FLAG_PROMO_B, FLAG_PROMO_R, FLAG_PROMO_Q };
 
-/* ---------------------------------------------------------------
-   MOVE ENCODING
-   ---------------------------------------------------------------
-   Idea
-   A chess move requires a source square, a target square, and
-   optional promotion information.
+#define C64(x) (x##ULL)
+#define bit(sq) (C64(1) << (sq))
+#define popcount(bb) __builtin_popcountll(bb)
+#define lsb(bb) __builtin_ctzll(bb)
 
-   Implementation
-   We pack this data into a single 32-bit integer for performance.
-   Passing a scalar integer by value is extremely fast and natively
-   supports register placement.
+static inline int pop_lsb(u64 *bb) { int sq = __builtin_ctzll(*bb); *bb &= *bb - 1; return sq; }
 
-   Bits  0.. 6  ->  from-square  (0-127)
-   Bits  7..13  ->  to-square    (0-127)
-   Bits 14..17  ->  promotion piece type (0 = none)
+/*
+   Move encoding (16 bits):
+     bits  0.. 5   from-square (0..63)
+     bits  6..11   to-square   (0..63)
+     bits 12..15   special move flags
 
-       move_from(m)          ->  m & 0x7F
-       move_to(m)            ->  (m >> 7) & 0x7F
-       move_promo(m)         ->  (m >> 14) & 0xF
-       make_move_enc(f,t,p)  ->  f|(t<<7)|(p<<14)
+     15..12   11..6      5..0
+     [ flag ] [ to-sq ] [ from-sq ]
+
+   Flags: 0=quiet, 1=double pawn push, 2=castle, 3=en passant,
+          4=promo knight, 5=promo bishop, 6=promo rook, 7=promo queen.
 */
 
-typedef int Move;
-static inline int  move_from(Move m) { return m & 0x7F; }
-static inline int  move_to(Move m) { return (m >> 7) & 0x7F; }
-static inline int  move_promo(Move m) { return (m >> 14) & 0xF; }
-static inline Move make_move_enc(int fr, int to, int p) { return fr | (to << 7) | (p << 14); }
+static inline Move encode_move(int f, int t, int fl) { return (Move)((f & 0x3F) | ((t & 0x3F) << 6) | ((fl & 0xF) << 12)); }
+static inline int move_from(Move m) { return m & 0x3F; } 
+static inline int move_to(Move m) { return (m >> 6) & 0x3F; }
+static inline int move_flag(Move m) { return (m >> 12) & 0xF; } 
+static inline int promo_piece(int fl) { return (fl - FLAG_PROMO_N) + KNIGHT; }
 
-/* ---------------------------------------------------------------
-   TRANSPOSITION TABLE (TT)
-   ---------------------------------------------------------------
-   Idea
-   Different move orders can reach the identical board position.
-   Evaluating the same node logic multiple times wastes time. A TT
-   caches search results, preventing redundant sub-tree exploration.
+/* A simple move list buffer. A chess position has at most 218 moves. */
+typedef struct { Move moves[256]; int count; } MoveList;
+static inline void push_move(MoveList *list, Move m) { list->moves[list->count++] = m; }
+static inline void push_promos(MoveList *list, int f, int t) { for (int fl = FLAG_PROMO_Q; fl >= FLAG_PROMO_N; fl--) push_move(list, encode_move(f, t, fl)); }
 
-   Implementation
-   We allocate a global hash map of `TTEntry` structures, indexed
-   by Zobrist keys. To minimize memory footprint and avoid cache
-   thrashing, the scalar values `depth` and `flag` are bitwise packed
-   into a single `unsigned char`.
+/* ================================================================
+   S2  ATTACKS & MAGIC TABLES
+   ================================================================
 
-   Pack:   depth_flag = (depth << 2) | flag
-   Unpack: depth = depth_flag >> 2
-           flag  = depth_flag & 3
+   Pawns, knights, and kings jump by fixed offsets regardless of
+   other pieces. Their attacks are precomputed into lookup tables:
+     pawn_attacks[color][sq]
+     knight_attacks[sq]
+     king_attacks[sq]
+
+   Bishops, rooks, and queens slide until they reach a board edge
+   or hit another piece. Tracing rays square by square during search
+   is slow. Instead, magic bitboards map any blocker arrangement to
+   a precomputed attack set in a single lookup:
+
+     index = ((occ & mask) * magic) >> shift;
+     attacks = table[index];
+
+   1. The mask contains only the inner squares of each ray; pieces on
+      the board rim stop the ray but cannot block beyond it.
+   2. Multiplying by a 64-bit constant ("magic") packs the relevant
+      blocker bits into the high bits of the product.
+   3. Shifting right leaves a compact, collision-free index.
+
+   During setup, the Carry-Rippler trick:
+     occ = (occ - mask) & mask;
+   iterates through every blocker subset of the mask without branching.
 */
 
-enum { TT_EXACT = 0, TT_ALPHA = 1, TT_BETA = 2 };
-typedef uint64_t HASH;  /* 64-bit Zobrist key -- halves collision rate vs 32-bit */
-typedef struct { HASH key; int score; Move best_move; unsigned int depth_flag; } TTEntry;
-TTEntry* tt = NULL;
-int64_t tt_size = 1 << 20;                                          /* default 1M entries = 16 MB */
-static inline unsigned int tt_depth(const TTEntry* e) { return e->depth_flag >> 2; }  /* bits 7..2 */
-static inline unsigned int tt_flag(const TTEntry* e)  { return e->depth_flag & 3; }   /* bits 1..0 */
-static inline unsigned int tt_pack(int d, int f)      { return (unsigned int)((d << 2) | f); }
+u64 pawn_attacks[2][64], knight_attacks[64], king_attacks[64], bishop_table[64 * 512], rook_table[64 * 4096];
+typedef struct { u64 mask, magic; int shift; u64 *table; } Magic;
+Magic bishop_magics[64], rook_magics[64];
 
-/* ---------------------------------------------------------------
-   UNDO HISTORY & KILLERS
-   ---------------------------------------------------------------
-   Idea
-   When un-making a move, we must restore the exact state prior to
-   its execution. However, some state transformations are destructive
-   and cannot be deduced natively (e.g., losing castling rights or
-   removing an en-passant square).
+const u64 BISHOP_MAGICS_CONST[64] = { C64(0x0842021001020884), C64(0x0014131444048100), C64(0x0108080120204050), C64(0x3209040500010100),C64(0x0004042000020858), C64(0x0001016050000440), C64(0x0002082108080008), C64(0x2822004208050821),C64(0x1485404801044290), C64(0x0c012108411900a0), C64(0x81010808912e0040), C64(0x0018040411840512),C64(0x0800040420050012), C64(0x2840020250140020), C64(0x4000210818021804), C64(0x0000010413040a30),C64(0x00500004a0080120), C64(0x0008000210840090), C64(0x20100001888a0040), C64(0x1301000804110088),C64(0x0004020880a00000), C64(0x129c802100a01106), C64(0x14020c8400840406), C64(0x0442000343040100),C64(0x201010006820e100), C64(0x2401282260880100), C64(0x0004020010002240), C64(0x0068080008820102),C64(0x4a25001101004010), C64(0x0003010002008c80), C64(0x0201004004044404), C64(0x701401022c208209),C64(0x005002c800105042), C64(0x0202304405020801), C64(0x0240203000880680), C64(0x00840a0080080080),C64(0x0020008402048020), C64(0x4010100480084048), C64(0x0008009080010801), C64(0x4002840140010100),C64(0x0024022050081560), C64(0x0809008804012082), C64(0x0000220130000a00), C64(0x0004001c24024800),C64(0x0e21031020800c00), C64(0x0240900400c14020), C64(0x0906021444008900), C64(0x20c80a4082053268),C64(0x880e441414400002), C64(0x0021018804020000), C64(0xa010002908080100), C64(0x0480802220880030),C64(0x20010010202a0020), C64(0x0800200a02020012), C64(0x4460080208414802), C64(0x0003120811010002),C64(0x0000440400880421), C64(0x4003902401241012), C64(0x1002900100413020), C64(0x1005804020a0a800),C64(0x11404a02b0020600), C64(0x006c004818302420), C64(0x0000508c10008200), C64(0x1a0520140101e100) };
+const u64 ROOK_MAGICS_CONST[64] = { C64(0x0080001924400080), C64(0x4040004010002000), C64(0x2100200100400811), C64(0x8b0004a008100100),C64(0x0200041020481200), C64(0x0100020100840018), C64(0x8300010004008200), C64(0x0180084100002c80),C64(0x0010800084a04002), C64(0x0013004004250082), C64(0x0011001101a000c2), C64(0x9001002009005000),C64(0x1001800400080181), C64(0x000a00100a000864), C64(0x0105000405000200), C64(0x400e000049029204),C64(0x0000818001c00060), C64(0x0290084000a00450), C64(0x0100808010006001), C64(0x2050010011002108),C64(0x2000818004002800), C64(0x0605808004009200), C64(0x0000040018100596), C64(0x4002020002e40081),C64(0x0241400080082080), C64(0x0040008080200040), C64(0xa200200480100083), C64(0x5002000a00201040),C64(0x2482001600081021), C64(0x80090400804a0080), C64(0x204010040048010a), C64(0x2068228600004401),C64(0x080a400022800484), C64(0xa062400080802001), C64(0x00008012020041a1), C64(0x0080b00081800800),C64(0x0040080011000d00), C64(0x0020804400801200), C64(0x0011000401008200), C64(0x2400042092000041),C64(0x2000400480a08000), C64(0x0000402010004000), C64(0x1021100020008080), C64(0x006030002101000a),C64(0x01050010c8010004), C64(0x0002000508420010), C64(0x000900020005000c), C64(0x6200006081060004),C64(0x8601008022044200), C64(0x2000c00280250100), C64(0x0100200080100880), C64(0x0121a00810010100),C64(0x1080820401180080), C64(0x1000020004008080), C64(0x0880010608100400), C64(0x000000a043040200),C64(0x00010080001020c1), C64(0x01101040008701a1), C64(0x3204300820820142), C64(0x4068210008443001),C64(0x0805000204180011), C64(0x1401000802040001), C64(0x0808081002408914), C64(0x1098118401082042) };
 
-   Implementation
-   We push destructive state factors onto a monotonic `history` stack
-   prior to every move. The Zobrist hash is also vaulted, enabling
-   O(1) hash restoration without scanning the board array backward.
-*/
+static const int s_dr[2][4] = {{1, -1, 0, 0}, {1, 1, -1, -1}}, s_df[2][4] = {{0, 0, 1, -1}, {1, -1, 1, -1}};
 
-typedef struct {
-    Move move; int piece_captured; int capt_slot;  int ep_square_prev; unsigned int castle_rights_prev; int halfmove_clock_prev; HASH hash_prev; int in_check;
-} State;
+static u64 slider_mask(int sq, int is_b) {
+    u64 m = 0; int r = sq / 8, f = sq % 8;
+    for (int i = 0; i < 4; i++)
+        for (int cr = r + s_dr[is_b][i], cf = f + s_df[is_b][i]; cr + s_dr[is_b][i] >= 0 && cr + s_dr[is_b][i] < 8 && cf + s_df[is_b][i] >= 0 && cf + s_df[is_b][i] < 8; cr += s_dr[is_b][i], cf += s_df[is_b][i])
+            m |= bit(cr * 8 + cf);
+    return m;
+}
 
-State history[1024];
+static u64 slider_attacks(int sq, u64 occ, int is_b) {
+    u64 a = 0; int r = sq / 8, f = sq % 8;
+    for (int i = 0; i < 4; i++)
+        for (int cr = r + s_dr[is_b][i], cf = f + s_df[is_b][i]; cr >= 0 && cr < 8 && cf >= 0 && cf < 8; cr += s_dr[is_b][i], cf += s_df[is_b][i]) {
+            a |= bit(cr * 8 + cf);
+            if (occ & bit(cr * 8 + cf)) break;
+        }
+    return a;
+}
 
-enum { MAX_PLY = 64 };
-Move killers[MAX_PLY][2];
+static void init_magics(void) {
+    for (int is_b = 0; is_b < 2; is_b++)
+        for (int sq = 0; sq < 64; sq++) {
+            Magic *m = is_b ? &bishop_magics[sq] : &rook_magics[sq];
+            m->mask = slider_mask(sq, is_b);
+            m->magic = is_b ? BISHOP_MAGICS_CONST[sq] : ROOK_MAGICS_CONST[sq];
+            m->shift = 64 - popcount(m->mask);
+            m->table = is_b ? &bishop_table[sq * 512] : &rook_table[sq * 4096];
+            u64 occ = 0;
+            do {
+                m->table[(unsigned int)((occ * m->magic) >> m->shift)] = slider_attacks(sq, occ, is_b);
+                occ = (occ - m->mask) & m->mask;
+            } while (occ);
+        }
+}
 
-/* ---------------------------------------------------------------
-   PRINCIPAL VARIATION TABLE
-   ---------------------------------------------------------------
-   Idea
-   The PV establishes the engine's "planned game." It tracks the best
-   expected continuous line of moves from the root down to the leaf.
-   This offers heuristic intuition for move ordering and exposes the
-   engine's internal contemplation to the external GUI.
-
-   Implementation
-   We utilize a triangular scalar array layout. At search ply P, the PV
-   covers subsequent positions strictly belonging to P through the leaf.
-
-   When a new best move is found at ply P:
-       pv[P][P] = best_move
-       copy pv[P+1][P+1..] into pv[P][P+1..]
-
-   By ascending through the recursion stack, the deepest best-move
-   evaluations automatically write themselves to the 0th element array.
-*/
-
-Move pv[MAX_PLY][MAX_PLY];
-int  pv_length[MAX_PLY];
-
-/* HISTORY TABLE
-   hist[from][to] holds a score in [-16000, 16000]:
-     +bonus (depth^2) each time from->to causes a beta cutoff (bonus).
-     -bonus for every other quiet move searched before that cutoff (malus).
-   Indexed by both squares so Nf3 and Bf3 never share a bucket.
-   Reset at the start of each search_root call.                          */
-int hist[128][128];
-
-/* LMR REDUCTION TABLE
-   lmr_table[depth][move_number] = reduction R, precomputed from
-   R = round(ln(depth) * ln(move_number) / 1.6), clamped to [1,5].
-   Captures, promotions, and check-giving moves bypass LMR entirely. */
-int lmr_table[32][64];
-
-/* TIME MANAGEMENT GLOBALS */
-clock_t t_start;
-int time_over_flag = 0;
-
-/* ===============================================================
-   S2  BOARD STATE
-   ===============================================================
-
-   Idea
-   The physical chessboard implies boundary limitations. Mapping an 8x8
-   chessboard to a 1D array requires bounds checking to prevent pieces
-   from sliding off the board horizontally or vertically.
-
-   Implementation (The 0x88 Method)
-   Instead of an 8x8 array (64 indices), we allocate a 16x8 array
-   (128 indices). The left 8 columns belong to the actual board. The
-   right 8 columns serve as phantom padding.
-
-   Any valid square has rank 0..7 and file 0..7, so bits 3 and 7
-   (the 0x88 mask) are always clear. Any out-of-range index will
-   have at least one of those bits set:
-
-       (sq & 0x88) != 0  ->  off the board
-*/
-
-static inline int sq_is_off(int sq) { return sq & 0x88; }
-#define FOR_EACH_SQ(sq) for(sq=0; sq<128; sq++) if(sq_is_off(sq)) sq+=7; else
-int board[128], side, xside, ep_square, ply, halfmove_clock;
-unsigned int castle_rights;    /* bits: 1=WO-O  2=WO-O-O  4=BO-O  8=BO-O-O */
-int count[2][7];               /* count[color][piece_type], piece_type 1..6  */
-HASH hash_key;
-
-int64_t nodes_searched; int root_depth; int best_root_move; /* search telemetry, reported in UCI info lines */
-
-/* Time control -- set by the go command handler before calling search_root.
-   time_budget_ms = milliseconds we are allowed to spend on this move.
-   0 means no time limit: search_root respects only max_depth.
-   search_root checks the clock after each completed depth iteration and
-   stops early if the elapsed time exceeds the budget. */
-int64_t time_budget_ms;
-
-/* root_ply: value of ply when search_root() was called.
-   Used by the repetition detector to distinguish in-tree positions
-   (where a single prior occurrence is sufficient to claim draw) from
-   game-history positions (which require two prior occurrences).     */
-int root_ply;
-
-/* ---------------------------------------------------------------
-   PIECE LIST
-   ---------------------------------------------------------------
-   Idea
-   Iterating the full 128-square board to find pieces is wasteful
-   since at most 32 squares are ever occupied. A compact piece list
-   lets the evaluator and other routines visit only live pieces.
-
-   Implementation
-   Two parallel arrays (list_piece[], list_square[]) hold piece type
-   and square for each of the up to 32 pieces. White occupies slots
-   0-15 and Black occupies slots 16-31. list_index[sq] maps a board
-   square back to its slot in O(1), enabling fast removal on captures.
-   list_count[color] tracks how many pieces each side has.
-
-   set_list() rebuilds the list from scratch (called after parse_fen).
-   make_move / undo_move update the list incrementally via list_index.
-*/
-
-enum { LIST_OFF = 0x88 };
-
-int list_piece[32];
-int list_square[32];
-int list_index[128];
-int list_count[2];
-
-/* Square helpers -- defined here so set_list and all later code can use them */
-static inline int piece_on(int sq)  { return board[sq]; }
-static inline int is_empty(int sq)  { return board[sq] == EMPTY; }
-static inline int piece_is(int sq, int c, int t) { return board[sq] == make_piece(c, t); }
-/* WARNING: color_on and ptype_on assume a non-empty square -- always
-   guard with !is_empty(sq) or piece_on(sq) before calling these.    */
-static inline int color_on(int sq)  { return piece_color(board[sq]); }
-static inline int ptype_on(int sq)  { return piece_type(board[sq]); }
-static inline int king_sq(int color) { return list_square[(color == WHITE ? 0 : 16) + list_count[color] - 1]; }
-static inline int list_slot_color(int i) { return (i < 16) ? WHITE : BLACK; }
-static inline void list_set_sq(int slot, int sq) { list_square[slot] = sq; list_index[sq] = slot; }
-static inline void list_remove(int slot, int sq) { list_square[slot] = LIST_OFF; list_index[sq] = -1; }
-
-static void set_list(void) {
-    int pt, sq;
-    for (int i = 0; i < 32; i++) { list_piece[i] = EMPTY; list_square[i] = LIST_OFF; }
-    for (sq = 0; sq < 128; sq++) list_index[sq] = -1;
-    list_count[WHITE] = list_count[BLACK] = 0;
-    for (pt = PAWN; pt <= KING; pt++) {
-        FOR_EACH_SQ(sq) {
-            int p = piece_on(sq); if (!p || piece_type(p) != pt) continue;
-            int color = piece_color(p);
-            int slot = (color == WHITE ? 0 : 16) + list_count[color]++;
-            list_piece[slot] = pt; list_square[slot] = sq; list_index[sq] = slot;
+void init_attacks(void) {
+    int dn[8][2] = {{2,1},{2,-1},{1,2},{1,-2},{-1,2},{-1,-2},{-2,1},{-2,-1}}, dk[8][2] = {{1,1},{1,0},{1,-1},{0,1},{0,-1},{-1,1},{-1,0},{-1,-1}};
+    for (int sq = 0; sq < 64; sq++) {
+        u64 b = bit(sq); int r = sq / 8, f = sq % 8;
+        pawn_attacks[WHITE][sq] = ((b << 9) & C64(0xFEFEFEFEFEFEFEFE)) | ((b << 7) & C64(0x7F7F7F7F7F7F7F7F));
+        pawn_attacks[BLACK][sq] = ((b >> 7) & C64(0xFEFEFEFEFEFEFEFE)) | ((b >> 9) & C64(0x7F7F7F7F7F7F7F7F));
+        knight_attacks[sq] = king_attacks[sq] = 0;
+        for (int i = 0; i < 8; i++) {
+            int nr = r + dn[i][0], nf = f + dn[i][1], kr = r + dk[i][0], kf = f + dk[i][1];
+            if (nr >= 0 && nr < 8 && nf >= 0 && nf < 8) knight_attacks[sq] |= bit(nr * 8 + nf);
+            if (kr >= 0 && kr < 8 && kf >= 0 && kf < 8) king_attacks[sq] |= bit(kr * 8 + kf);
         }
     }
+    init_magics();
 }
 
-/* ===============================================================
-   S3  DIRECTION & CASTLING DATA
-   ===============================================================
+static inline u64 get_bishop_attacks(int sq, u64 occ) { Magic *m = &bishop_magics[sq]; return m->table[(unsigned int)(((occ & m->mask) * m->magic) >> m->shift)]; }
+static inline u64 get_rook_attacks(int sq, u64 occ) { Magic *m = &rook_magics[sq]; return m->table[(unsigned int)(((occ & m->mask) * m->magic) >> m->shift)]; }
+static inline u64 get_queen_attacks(int sq, u64 occ) { return get_bishop_attacks(sq, occ) | get_rook_attacks(sq, occ); }
 
-   Idea
-   Hard-coding piece direction vectors as a flat array means the move
-   generator and attack detector can share the same data without any
-   per-call coordinate arithmetic.
+typedef struct { u64 pieces[2][6], occ[3], hash; int side, castling, ep, halfmove, fullmove; uint8_t mailbox[64]; } Position;
+typedef struct { u64 hash; int castling, ep, halfmove, captured; } UndoInfo;
 
-   Implementation
-   One rank step = +/-16, one file step = +/-1 on the 0x88 grid.
-   Knights, bishops, rooks, and the king occupy contiguous slices of
-   `step_dir`, delimited by `piece_offsets[]` and `piece_limits[]`.
+/* ================================================================
+   S3  ZOBRIST HASHING & TRANSPOSITION TABLE
+   ================================================================
 
-   Castling data lives in four parallel arrays indexed 0-3
-   (White O-O, White O-O-O, Black O-O, Black O-O-O). The move
-   generator checks all four entries against the current rights bits.
+   Different move orders often reach the same position (a transposition).
+   Zobrist hashing assigns a 64-bit random number to each piece on each
+   square (768 values), the side to move, castling rights, and en passant
+   files.
+
+   Because exclusive-or is its own inverse (x ^ y ^ y == x), making or
+   undoing a move updates the hash with simple XOR operations:
+     pos->hash ^= zobrist_piece[color][piece][from];
+     pos->hash ^= zobrist_piece[color][piece][to];
+   No board rescanning is needed. A 64-bit xorshift generator seeds
+   these tables deterministically at startup.
+
+   The transposition table (TT) caches previous search results. If a
+   position is visited again at equal or greater depth, the stored
+   score or bound can be returned immediately. Even without a cutoff,
+   the stored best move guides move ordering.
+
+   Each entry occupies 16 bytes:
+     key    64-bit hash to verify exact match
+     score  search score
+     move   best move found
+     depth  search depth
+     bound  EXACT, ALPHA (upper bound), or BETA (lower bound)
+     age    generation counter to retire stale entries
+
+   Mate scores depend on distance from root; we add ply before storing
+   and subtract ply after probing so cached values remain independent of
+   search depth.
 */
 
-int step_dir[] = {
-    0,0,0,0,                        /* padding: aligns with piece enum       */
-    -33,-31,-18,-14,14,18,31,33,    /* Knight  (idx 4-11)                    */
-    -17,-15, 15, 17,                /* Bishop  (idx 12-15)                   */
-    -16, -1,  1, 16,                /* Rook    (idx 16-19)                   */
-    -17,-16,-15,-1,1,15,16,17       /* King    (idx 20-27)                   */
-};
-int piece_offsets[] = { 0,0, 4,12,16,12,20 };
-int piece_limits[] = { 0,0,12,16,20,20,28 };
+u64 zobrist_piece[2][6][64], zobrist_side, zobrist_castle[16], zobrist_ep[64];
 
-/* Castling move data: index 0-1 = White, 2-3 = Black */
-static const int castle_kf[] = { 4, 4, 116, 116 }, castle_kt[] = { 6, 2, 118, 114 };
-static const int castle_rf[] = { 7, 0, 119, 112 }, castle_rt[] = { 5, 3, 117, 115 };
-static const int castle_col[] = { WHITE, WHITE, BLACK, BLACK };
-static const unsigned int castle_kmask[] = { ~3u, ~3u, ~12u, ~12u }; /* Rights stripped when king moves */
-static const int cr_sq[] = { 0, 7, 112, 119 };
-static const unsigned int cr_mask[] = { ~2u, ~1u, ~8u, ~4u }; /* Corner squares */
-
-/* ===============================================================
-   S4  ZOBRIST HASHING
-   ===============================================================
-
-   Idea
-   Fast position comparison requires a mathematical fingerprint. By
-   assigning a random 64-bit integer to every possible piece-square
-   combination (along with side-to-move, en-passant, and castling
-   rights), we can XOR all active elements together to generate a
-   near-unique position key.
-
-   Implementation
-   Because XOR is self-inverse (A ^ B ^ B = A), adding or removing a
-   piece uses the identical bitwise operation:
-       hash ^= zobrist_piece[color][type][sq]
-
-   The hash incrementally updates during `make_move`. Restoring the
-   hash in `undo_move` requires O(1) complexity using the historical
-   record.
-*/
-
-HASH         zobrist_piece[2][7][128];
-HASH         zobrist_side;
-HASH         zobrist_ep[128];
-HASH         zobrist_castle[16];
-
-/* xorshift64* PRNG */
-static HASH rand64(void) {
-    static HASH s = 1070372631ULL;
-    s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
-    return s * 0x2545F4914F6CDD1DULL;
-}
+static u64 rand64(u64 *s) { *s ^= *s >> 12; *s ^= *s << 25; *s ^= *s >> 27; return *s * C64(0x2545F4914F6CDD1D); }
 
 void init_zobrist(void) {
-    for (int c = 0; c < 2; c++) for (int p = 0; p < 7; p++) for (int s = 0; s < 128; s++)
-        zobrist_piece[c][p][s] = rand64();
-    zobrist_side = rand64();
-    for (int s = 0; s < 128; s++) zobrist_ep[s] = rand64();
-    for (int s = 0; s < 16; s++) zobrist_castle[s] = rand64();
+    u64 s = C64(0x9E3779B97F4A7C15);
+    for (int i = 0; i < 768; i++) ((u64*)zobrist_piece)[i] = rand64(&s);
+    zobrist_side = rand64(&s);
+    for (int i = 0; i < 16; i++) zobrist_castle[i] = rand64(&s);
+    for (int i = 0; i < 64; i++) zobrist_ep[i] = rand64(&s);
 }
 
-/* Populate lmr_table once at startup; called from uci_init.
-   Index 0 is unused (depth=0 or move=0 never reach LMR). */
-
-HASH generate_hash(void) {
-    HASH h = 0; int sq;
-    FOR_EACH_SQ(sq) if (piece_on(sq)) h ^= zobrist_piece[color_on(sq)][ptype_on(sq)][sq];
-    if (side == BLACK)        h ^= zobrist_side;
-    if (ep_square != SQ_NONE) h ^= zobrist_ep[ep_square];
-    return h ^ zobrist_castle[castle_rights];
+u64 generate_hash(const Position *pos) {
+    u64 h = 0;
+    for (int c = 0; c < 2; c++)
+        for (int pt = 0; pt < 6; pt++)
+            for (u64 bb = pos->pieces[c][pt]; bb; ) h ^= zobrist_piece[c][pt][pop_lsb(&bb)];
+    if (pos->side == BLACK) h ^= zobrist_side;
+    if (pos->ep != SQ_NONE) h ^= zobrist_ep[pos->ep];
+    return h ^ zobrist_castle[pos->castling];
 }
 
-/* ===============================================================
-   S5  ATTACK DETECTION
-   ===============================================================
+enum { TT_NONE = 0, TT_EXACT = 1, TT_ALPHA = 2, TT_BETA = 3 };
+typedef struct { u64 key; int16_t score; Move move; uint8_t depth, bound, age, padding; } TTEntry;
+TTEntry *tt = NULL; size_t tt_mask = 0; uint8_t tt_age = 0;
 
-   Idea
-   To determine if a square is attacked, iterating through every
-   enemy piece and generating their moves is wildly inefficient.
-   Instead, we reverse the perspective: fire ray-traces outward
-   from the target square and check if a capable enemy intercepts it.
+int tt_allocate(size_t mb) {
+    if (tt) free(tt);
+    size_t count = (mb * 1024 * 1024) / sizeof(TTEntry), pow2 = 1;
+    while (pow2 * 2 <= count) pow2 *= 2;
+    tt = (TTEntry*)calloc(pow2, sizeof(TTEntry));
+    return tt ? (tt_mask = pow2 - 1, 1) : 0;
+}
 
-   Implementation
-   Using the `step_dir` array (S3), we fire ray-traces outward from `sq`.
-   Non-sliding pieces (pawns, knights, king) are checked with direct square
-   lookups. Sliders (bishop, rook, queen) use a while-loop that walks the
-   ray until it hits a piece or the board edge.  Separating leapers from
-   sliders removes the leaper-break branch from the hot slider inner loop.
-*/
+void tt_clear(void) { if (tt) memset(tt, 0, (tt_mask + 1) * sizeof(TTEntry)); tt_age = 0; }
 
-static inline int is_square_attacked(int sq, int ac) {
-    int tgt;
-    /* Pawn attacks */
-    if (ac == WHITE) {
-        tgt = sq - 17; if (!sq_is_off(tgt) && board[tgt] == WP) return 1;
-        tgt = sq - 15; if (!sq_is_off(tgt) && board[tgt] == WP) return 1;
-    } else {
-        tgt = sq + 15; if (!sq_is_off(tgt) && board[tgt] == BP) return 1;
-        tgt = sq + 17; if (!sq_is_off(tgt) && board[tgt] == BP) return 1;
+static inline int tt_probe(u64 hash, int depth, int alpha, int beta, int ply, Move *tt_move, int *tt_score, int *tt_bound) {
+    if (!tt) return 0;
+    TTEntry *e = &tt[hash & tt_mask];
+    if (e->key != hash) return 0;
+    *tt_move = e->move;
+    int sc = e->score;
+    if (sc > 30000 - 512) sc -= ply; else if (sc < -30000 + 512) sc += ply;
+    *tt_score = sc;
+    if (tt_bound) *tt_bound = e->bound;
+    if (e->depth >= depth) {
+        if (e->bound == TT_EXACT || (e->bound == TT_ALPHA && sc <= alpha) || (e->bound == TT_BETA && sc >= beta)) return 1;
     }
-    /* Knight attacks: eight L-shaped jumps */
-    for (int i = piece_offsets[KNIGHT]; i < piece_limits[KNIGHT]; i++)
-        if (!sq_is_off(sq + step_dir[i]) && board[sq + step_dir[i]] == make_piece(ac, KNIGHT)) return 1;
-    /* Slider attacks: bishops, rooks, queens.
-       piece_offsets[BISHOP]..piece_limits[QUEEN] covers all 8 ray directions.
-       Diagonal rays [BISHOP range] match bishops/queens; orthogonal [ROOK range] match rooks/queens. */
-    for (int i = piece_offsets[BISHOP]; i < piece_limits[QUEEN]; i++) {
-        int step = step_dir[i], tgt = sq + step;
-        while (!sq_is_off(tgt)) {
-            int p = piece_on(tgt);
-            if (p) {
-                if (piece_color(p) == ac) {
-                    int pt = piece_type(p);
-                    /* The direction index i tells us which piece types
-                       can attack along this particular ray*/
-                    if (i >= piece_offsets[BISHOP] && pt == QUEEN) return 1;
-                    if (i >= piece_offsets[BISHOP] && i < piece_limits[BISHOP] && pt == BISHOP) return 1;
-                    if (i >= piece_offsets[ROOK] && i < piece_limits[ROOK] && pt == ROOK) return 1;
-                }
-                break; /* A piece blocked the ray */
-            }
-            tgt += step;
-        }
-    }
-    /* King attacks: eight one-step directions */
-    for (int i = piece_offsets[KING]; i < piece_limits[KING]; i++)
-        if (!sq_is_off(sq + step_dir[i]) && board[sq + step_dir[i]] == make_piece(ac, KING)) return 1;
     return 0;
 }
 
-/* ===============================================================
-   S6  MAKE / UNDO MOVE
-   ===============================================================
+static inline void tt_store(u64 hash, int depth, int score, int bound, Move m, int ply) {
+    if (!tt) return;
+    TTEntry *e = &tt[hash & tt_mask];
+    if (score > 30000 - 512) score += ply; else if (score < -30000 + 512) score -= ply;
+    if (e->key != hash || depth >= e->depth || e->age != tt_age) {
+        e->key = hash; e->score = (int16_t)score; e->depth = (uint8_t)depth; e->bound = (uint8_t)bound;
+        if (m || e->key != hash) e->move = m;
+        e->age = tt_age;
+    }
+}
 
-   Idea
-   Moving a piece alters the board state incrementally. To prevent
-   expensive full-board copies, `make_move` executes the move in-place
-   while caching irreversible details (castling rights, en-passant)
-   onto the `history` stack.
+/* ================================================================
+   S4  NNUE EVALUATION & ACCUMULATOR
+   ================================================================
 
-   Implementation
-   1. Snapshot irreversible state.
-   2. Execute the primary piece transfer (from-square to to-square).
-   3. Update the Zobrist hash sequentially.
-   4. Process special cases (en-passant, promotions, and table-driven castling).
+   NNUE evaluates positions with a small neural network. The first
+   layer (the accumulator) is a linear sum of weight vectors for
+   each piece on the board:
+     768 inputs (2 sides * 6 piece types * 64 squares) -> 32 values.
 
-   The `undo_move` function identically reverses this process, reading
-   the `history` stack to repair the destructive state perfectly.
+   Because the accumulator is purely additive, moving a piece requires
+   only subtracting the weights of the vacated square and adding the
+   weights of the new square. The 32 16-bit values fit across two
+   256-bit AVX2 registers (via GCC's v16 vector type).
+
+   Each side maintains its own perspective; Black's view flips the
+   board vertically (sq ^ 56). The hidden values pass through a
+   squared clipped linear unit (SCReLU: clamp to [0, 255], square),
+   and the output layer computes an inner product scaled to centipawns.
 */
 
-/* Convenience attack functions.
-   in_check(s)  -- is side s's king currently in check?
-   is_illegal() -- after make_move (side/xside swapped), did the mover
-                   leave their own king in check? */
-static inline int in_check(int s) { return is_square_attacked(king_sq(s), s ^ 1); }
-static inline int is_illegal(void) { return is_square_attacked(king_sq(xside), side); }
+typedef int16_t i16; typedef int32_t i32; typedef i16 v16 __attribute__((vector_size(32)));
 
-static inline void add_move(Move* list, int* n, int fr, int to, int pr) { list[(*n)++] = make_move_enc(fr, to, pr); }
+enum {
+    NNUE_INPUT_SIZE  = 768, NNUE_HIDDEN_SIZE = 32,
+    NNUE_VECTORS     = NNUE_HIDDEN_SIZE / 16,
+    NNUE_EVAL_SCALE  = 400, NNUE_L0_SCALE = 255, NNUE_L1_SCALE = 64
+};
 
-/* Add all four promotion possibilities for a pawn move from f to t. */
-static void add_promo(Move* list, int* n, int fr, int to) {
-    for (int pr = QUEEN; pr >= KNIGHT; pr--) add_move(list, n, fr, to, pr);
+typedef struct {
+    i16 input_weights[NNUE_INPUT_SIZE][NNUE_HIDDEN_SIZE], input_biases[NNUE_HIDDEN_SIZE];
+    i16 output_weights[2][NNUE_HIDDEN_SIZE], output_bias;
+} NNUEParameters;
+
+typedef union __attribute__((aligned(64))) {
+    i16 accumulation[2][NNUE_HIDDEN_SIZE];
+    v16 vec[2][NNUE_VECTORS];
+} Accumulator;
+
+typedef struct { Accumulator stack[1024]; int loaded; } NNUEState;
+static __attribute__((aligned(64))) NNUEParameters nnue_params; static NNUEState nnue; int acc_ply = 0;
+
+#include "net.h"
+
+static inline i32 nnue_screlu(i32 x) { i32 c = (x < 0) ? 0 : ((x > NNUE_L0_SCALE) ? NNUE_L0_SCALE : x); return c * c; }
+
+static inline void nnue_feat(int c, int pt, int sq, const v16 **pw, const v16 **pb) {
+    *pw = (const v16 *)nnue_params.input_weights[c * 384 + pt * 64 + sq];
+    *pb = (const v16 *)nnue_params.input_weights[(c ^ 1) * 384 + pt * 64 + (sq ^ 56)];
 }
 
-/* XOR piece (color c, type p) at sq in or out of the running Zobrist hash.
-   Because XOR is self-inverse, toggling the same value twice cancels out,
-   which is exactly what make_move uses when it moves a piece from f to t:
-       toggle(side, pt, f)  -- remove from source
-       toggle(side, pt, t)  -- place at destination                        */
-static inline void toggle(int c, int p, int sq) { hash_key ^= zobrist_piece[c][p][sq]; }
-
-void make_move(Move m) {
-
-    /* Setting the variables */
-    int fr = move_from(m), to = move_to(m), pr = move_promo(m), p = piece_on(fr), pt = piece_type(p), cap = piece_on(to);
-
-    /* Saving move data for unmaking */
-    history[ply].move = m; history[ply].piece_captured = cap; history[ply].ep_square_prev = ep_square;
-    history[ply].castle_rights_prev = castle_rights; history[ply].halfmove_clock_prev = halfmove_clock; history[ply].hash_prev = hash_key;
-    halfmove_clock = (pt == PAWN || cap) ? 0 : halfmove_clock + 1;
-    history[ply].capt_slot = -1;
-
-    /* En passant capture */
-    if (pt == PAWN && to == ep_square) {
-        int ep_pawn = to + (side == WHITE ? -16 : 16);
-        history[ply].piece_captured = piece_on(ep_pawn);
-        history[ply].capt_slot = list_index[ep_pawn];
-        list_square[history[ply].capt_slot] = LIST_OFF; list_index[ep_pawn] = -1;
-        board[ep_pawn] = EMPTY;
-        toggle(xside, PAWN, ep_pawn);
-        count[xside][PAWN]--;
+static inline void nnue_add1sub1(Accumulator *dst, const Accumulator *src, int ac, int apt, int asq, int sc, int spt, int ssq) {
+    const v16 *aw, *ab, *sw, *sb;
+    nnue_feat(ac, apt, asq, &aw, &ab); nnue_feat(sc, spt, ssq, &sw, &sb);
+    for (int i = 0; i < NNUE_VECTORS; i++) {
+        dst->vec[0][i] = src->vec[0][i] + aw[i] - sw[i];
+        dst->vec[1][i] = src->vec[1][i] + ab[i] - sb[i];
     }
-
-    /* Normal capture */
-    if (cap) {
-        history[ply].capt_slot = list_index[to];
-        list_remove(list_index[to], to);
-        toggle(xside, piece_type(cap), to); count[xside][piece_type(cap)]--;
-    }
-
-    /* Move piece */
-    list_set_sq(list_index[fr], to); list_index[fr] = -1;
-    board[to] = p; board[fr] = EMPTY;
-    toggle(side, pt, fr); toggle(side, pt, to);
-
-    /* Promotion */
-    if (pr) {
-        int slot = list_index[to]; list_piece[slot] = pr;
-        board[to] = make_piece(side, pr); toggle(side, pt, to); toggle(side, pr, to);
-        count[side][PAWN]--; count[side][pr]++;
-    }
-
-    /* Castling */
-    hash_key ^= zobrist_castle[castle_rights];
-    if (pt == KING) {
-        for (int ci = 0; ci < 4; ci++) {
-            if (fr == castle_kf[ci] && to == castle_kt[ci]) {
-                int rook_from = castle_rf[ci]; int rook_to = castle_rt[ci]; int rook_slot = list_index[rook_from];
-                board[rook_from] = EMPTY; board[rook_to] = make_piece(castle_col[ci], ROOK);
-                list_set_sq(rook_slot, rook_to); list_index[rook_from] = -1;
-                toggle(castle_col[ci], ROOK, rook_from);  toggle(castle_col[ci], ROOK, rook_to);
-                break;
-            }
-        }
-        castle_rights &= castle_kmask[side * 2]; /* WHITE=0->index 0, BLACK=1->index 2 */
-    }
-    for (int ci = 0; ci < 4; ci++) if (fr == cr_sq[ci] || to == cr_sq[ci]) castle_rights &= cr_mask[ci]; /* Strip castling */
-    hash_key ^= zobrist_castle[castle_rights];
-
-    /* Setting en passant square */
-    if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
-    ep_square = SQ_NONE;
-    if (pt == PAWN && ((to - fr) == 32 || (fr - to) == 32)) { ep_square = fr + (side == WHITE ? 16 : -16); hash_key ^= zobrist_ep[ep_square]; }
-
-    /* Changing side to move */
-    hash_key ^= zobrist_side; side ^= 1; xside ^= 1;
-    history[ply].in_check = is_square_attacked(king_sq(side), xside);
-    ply++;
 }
 
-void undo_move(void) {
-    ply--; side ^= 1; xside ^= 1;
-    Move m = history[ply].move; int fr = move_from(m), to = move_to(m), pr = move_promo(m);
-    int cap = history[ply].piece_captured;
-
-    /* Move piece back: to -> fr */
-    list_set_sq(list_index[to], fr); list_index[to] = -1;
-    board[fr] = board[to]; board[to] = cap;
-
-    /* Undo promotion */
-    if (pr) {
-        int slot = list_index[fr]; list_piece[slot] = PAWN;
-        board[fr] = make_piece(side, PAWN); count[side][pr]--; count[side][PAWN]++;
+static inline void nnue_add1sub2(Accumulator *dst, const Accumulator *src, int ac, int apt, int asq, int s1c, int s1pt, int s1sq, int s2c, int s2pt, int s2sq) {
+    const v16 *aw, *ab, *s1w, *s1b, *s2w, *s2b;
+    nnue_feat(ac, apt, asq, &aw, &ab); nnue_feat(s1c, s1pt, s1sq, &s1w, &s1b); nnue_feat(s2c, s2pt, s2sq, &s2w, &s2b);
+    for (int i = 0; i < NNUE_VECTORS; i++) {
+        dst->vec[0][i] = src->vec[0][i] + aw[i] - s1w[i] - s2w[i];
+        dst->vec[1][i] = src->vec[1][i] + ab[i] - s1b[i] - s2b[i];
     }
-    int pt = ptype_on(fr);
-
-    /* Undo en passant */
-    if (pt == PAWN && to == history[ply].ep_square_prev) {
-        int ep_pawn = to + (side == WHITE ? -16 : 16);
-        board[to] = EMPTY;
-        board[ep_pawn] = cap;
-        if (cap) list_set_sq(history[ply].capt_slot, ep_pawn);
-        count[xside][PAWN]++;
-    /* Undo normal capture */
-    } else if (cap) {
-        list_set_sq(history[ply].capt_slot, to);
-        count[xside][piece_type(cap)]++;
-    }
-
-    /* Undo castling */
-    if (pt == KING) {
-        for (int ci = 0; ci < 4; ci++) {
-            if (fr == castle_kf[ci] && to == castle_kt[ci]) {
-                int rook_from = castle_rt[ci]; int rook_to = castle_rf[ci]; int rook_slot = list_index[rook_from];
-                board[rook_from] = EMPTY; board[rook_to] = make_piece(castle_col[ci], ROOK);
-                list_set_sq(rook_slot, rook_to); list_index[rook_from] = -1;
-                break;
-            }
-        }
-    }
-
-    /* Restore irreversible state */
-    ep_square = history[ply].ep_square_prev; castle_rights = history[ply].castle_rights_prev;
-    halfmove_clock = history[ply].halfmove_clock_prev;
-    hash_key = history[ply].hash_prev;
 }
 
-/* ===============================================================
-   S7  MOVE GENERATION
-   ===============================================================
+static inline void nnue_add2sub2(Accumulator *dst, const Accumulator *src, int a1c, int a1pt, int a1sq, int a2c, int a2pt, int a2sq, int s1c, int s1pt, int s1sq, int s2c, int s2pt, int s2sq) {
+    const v16 *a1w, *a1b, *a2w, *a2b, *s1w, *s1b, *s2w, *s2b;
+    nnue_feat(a1c, a1pt, a1sq, &a1w, &a1b); nnue_feat(a2c, a2pt, a2sq, &a2w, &a2b);
+    nnue_feat(s1c, s1pt, s1sq, &s1w, &s1b); nnue_feat(s2c, s2pt, s2sq, &s2w, &s2b);
+    for (int i = 0; i < NNUE_VECTORS; i++) {
+        dst->vec[0][i] = src->vec[0][i] + a1w[i] + a2w[i] - s1w[i] - s2w[i];
+        dst->vec[1][i] = src->vec[1][i] + a1b[i] + a2b[i] - s1b[i] - s2b[i];
+    }
+}
 
-   Idea
-   Full legal-move generation requires a check test for every candidate,
-   which is expensive.  Instead, we generate pseudo-legal moves
-   (geometrically valid but possibly leaving the king in check) and
-   discard illegal ones inside the search loop after `make_move`.
-
-   Implementation
-   The generator is unified: `caps_only=1` restricts output to captures
-   and promotions, which is exactly what quiescence search needs.
-
-   1. Pawns: handled separately -- direction, double-push, and
-      en-passant all depend on colour.
-   2. Sliders & leapers: iterated via `step_dir` ray traces.
-   3. Castling: only generated when `caps_only=0`; verified by
-      checking that the path is clear and unattacked.
-*/
-
-int generate_moves(Move* moves, int caps_only) {
-    int cnt = 0;
-    int d_pawn = (side == WHITE) ? 16 : -16;
-    int pawn_start = (side == WHITE) ? 1 : 6;
-    int pawn_promo = (side == WHITE) ? 6 : 1;
-
-    for (int slot = (side == WHITE ? 0 : 16); slot < (side == WHITE ? 16 : 32); slot++) {
-        int sq = list_square[slot];
-        if (sq == LIST_OFF) continue;
-        int pt = list_piece[slot];
-
-        /* -- Pawns ------------------------------------------------ */
-        if (pt == PAWN) {
-            int tgt = sq + d_pawn;
-            if (!sq_is_off(tgt) && is_empty(tgt)) {
-                if ((sq >> 4) == pawn_promo) add_promo(moves, &cnt, sq, tgt);
-                else if (!caps_only) {
-                    add_move(moves, &cnt, sq, tgt, 0);
-                    if ((sq >> 4) == pawn_start && is_empty(tgt + d_pawn)) add_move(moves, &cnt, sq, tgt + d_pawn, 0);
+void nnue_refresh(const Position *pos) {
+    acc_ply = 0;
+    const v16 *bias = (const v16 *)nnue_params.input_biases;
+    for (int i = 0; i < NNUE_VECTORS; i++) nnue.stack[0].vec[0][i] = nnue.stack[0].vec[1][i] = bias[i];
+    for (int c = 0; c < 2; c++)
+        for (int pt = 0; pt < 6; pt++)
+            for (u64 bb = pos->pieces[c][pt]; bb; ) {
+                const v16 *w, *b;
+                nnue_feat(c, pt, pop_lsb(&bb), &w, &b);
+                for (int i = 0; i < NNUE_VECTORS; i++) {
+                    nnue.stack[0].vec[0][i] += w[i];
+                    nnue.stack[0].vec[1][i] += b[i];
                 }
             }
-            for (int i = -1; i <= 1; i += 2) {           /* diagonal captures + ep */
-                tgt = sq + d_pawn + i;
-                if (!sq_is_off(tgt) && ((!is_empty(tgt) && color_on(tgt) == xside) || tgt == ep_square)) {
-                    if ((sq >> 4) == pawn_promo) add_promo(moves, &cnt, sq, tgt);
-                    else add_move(moves, &cnt, sq, tgt, 0);
-                }
-            }
-            continue;
-        }
-
-        /* -- Leapers (knight / king): single step, no ray continuation -- */
-        if (pt == KNIGHT || pt == KING) {
-            for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
-                int tgt = sq + step_dir[i]; if (sq_is_off(tgt)) continue;
-                if (is_empty(tgt)) { if (!caps_only) add_move(moves, &cnt, sq, tgt, 0); }
-                else if (color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
-            }
-        } else {
-        /* -- Sliders (bishop / rook / queen): ray trace ----------- */
-            for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
-                int step = step_dir[i], tgt = sq + step;
-                while (!sq_is_off(tgt)) {
-                    if (is_empty(tgt)) {
-                        if (!caps_only) add_move(moves, &cnt, sq, tgt, 0);
-                    } else {
-                        if (color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
-                        break;
-                    }
-                    tgt += step;
-                }
-            }
-        }
-
-        /* -- Castling (king only, never in caps_only mode) -------- */
-        if (pt == KING && !caps_only) {
-            int kf, kt, rf, bit, ac, clear_ok;
-            for (int ci = 0; ci < 4; ci++) {
-                kf = castle_kf[ci]; kt = castle_kt[ci]; rf = castle_rf[ci];
-                bit = (ci == 0) ? 1 : (ci == 1) ? 2 : (ci == 2) ? 4 : 8;
-                ac = (castle_col[ci] == WHITE) ? BLACK : WHITE;
-
-                if (sq != kf || castle_col[ci] != side) continue;
-                if (!(castle_rights & (unsigned int)bit)) continue;
-                if (piece_on(rf) != make_piece(side, ROOK)) continue;
-
-                /* Every square between king and rook must be empty */
-                int sq1 = (kf < rf) ? kf + 1 : rf + 1, sq2 = (kf < rf) ? rf : kf;
-                clear_ok = 1;
-                for (int sq3 = sq1; sq3 < sq2; sq3++)
-                    if (!is_empty(sq3)) { clear_ok = 0; break; }
-                if (!clear_ok) continue;
-
-                /* King's path must not traverse attacked squares */
-                int step2 = (kt > kf) ? 1 : -1;
-                clear_ok = 1;
-                for (int sq3 = kf; sq3 != (kt + step2); sq3 += step2)
-                    if (is_square_attacked(sq3, ac)) { clear_ok = 0; break; }
-                if (clear_ok) add_move(moves, &cnt, kf, kt, 0);
-            }
-        }
-    }
-    return cnt;
 }
 
-/* Capture-only move generator for quiescence search.
-   Avoids all quiet-move branches and the entire castling block. */
-int generate_captures(Move* moves) {
-    int cnt = 0;
-    int d_pawn = (side == WHITE) ? 16 : -16;
-    int pawn_promo = (side == WHITE) ? 6 : 1;
-
-    for (int slot = (side == WHITE ? 0 : 16); slot < (side == WHITE ? 16 : 32); slot++) {
-        int sq = list_square[slot];
-        if (sq == LIST_OFF) continue;
-        int pt = list_piece[slot];
-
-        if (pt == PAWN) {
-            int tgt = sq + d_pawn;                                  /* quiet promo */
-            if ((sq >> 4) == pawn_promo && !sq_is_off(tgt) && is_empty(tgt))
-                add_promo(moves, &cnt, sq, tgt);
-            for (int i = -1; i <= 1; i += 2) {                     /* diagonal captures + ep */
-                tgt = sq + d_pawn + i;
-                if (!sq_is_off(tgt) && ((!is_empty(tgt) && color_on(tgt) == xside) || tgt == ep_square)) {
-                    if ((sq >> 4) == pawn_promo) add_promo(moves, &cnt, sq, tgt);
-                    else add_move(moves, &cnt, sq, tgt, 0);
-                }
-            }
-            continue;
-        }
-
-        if (pt == KNIGHT || pt == KING) {
-            for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
-                int tgt = sq + step_dir[i];
-                if (!sq_is_off(tgt) && !is_empty(tgt) && color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
-            }
-        } else {
-            for (int i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
-                int step = step_dir[i], tgt = sq + step;
-                while (!sq_is_off(tgt) && is_empty(tgt)) tgt += step;
-                if (!sq_is_off(tgt) && color_on(tgt) == xside) add_move(moves, &cnt, sq, tgt, 0);
-            }
-        }
-    }
-    return cnt;
+int nnue_evaluate(const Position *pos) {
+    int stm = pos->side;
+    const Accumulator *acc = &nnue.stack[acc_ply];
+    const i16 *acc0 = acc->accumulation[stm], *acc1 = acc->accumulation[stm ^ 1];
+    const i16 *w0 = nnue_params.output_weights[0], *w1 = nnue_params.output_weights[1];
+    i32 score = 0;
+    for (int i = 0; i < NNUE_HIDDEN_SIZE; i++)
+        score += nnue_screlu(acc0[i]) * (i32)w0[i] + nnue_screlu(acc1[i]) * (i32)w1[i];
+    return (int)(((score / NNUE_L0_SCALE) + nnue_params.output_bias) * NNUE_EVAL_SCALE / (NNUE_L0_SCALE * NNUE_L1_SCALE));
 }
 
-/* ===============================================================
-   S8  FEN PARSER
-   ===============================================================
+int nnue_init(const char *path) {
+    size_t need = sizeof(nnue_params);
+    if ((size_t)nnue_embedded_size >= need) {
+        memcpy(&nnue_params, nnue_embedded, need);
+        return (nnue.loaded = 1);
+    }
+    if (path) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            size_t got = fread(&nnue_params, 1, need, f);
+            fclose(f);
+            return (nnue.loaded = (got == need));
+        }
+    }
+    return 0;
+}
 
-   Idea
-   Forsyth-Edwards Notation (FEN) is the standard ASCII string format
-   for representing a distinct board state.
+/* ================================================================
+   S5  BOARD REPRESENTATION & MAKE/UNDO
+   ================================================================
 
-   Implementation
-   The parser reads the space-delimited fields sequentially:
-   1. Piece placement (ranks 8 down to 1).
-   2. Side to move ('w' or 'b').
-   3. Castling rights ('K', 'Q', 'k', 'q').
-   4. En-passant target square.
+   The board state is kept in two forms at once: bitboards (for fast
+   piece sets, occupancy, and attack generation) and a 64-byte mailbox
+   array (so we know what piece occupies a square without checking
+   twelve bitboards). `set_piece` and `clear_piece` maintain both.
+
+   To test whether square S is attacked by side C, we look outward
+   from S along each piece's movement pattern: if a knight jump from S
+   lands on a C knight, or a diagonal ray from S hits a C bishop or
+   queen, the square is attacked. A king is in check when its square
+   is attacked by the opposing side.
+
+   `make_move` updates the board and records irreversible state
+   (hash, castling rights, en passant square, 50-move clock, and the
+   captured piece) in an UndoInfo structure on the stack. The NNUE
+   accumulator is updated incrementally for the new ply. `undo_move`
+   restores the previous board and decrements the accumulator stack.
+   Castling rights are updated by ANDing a mask for each touched square:
+     castling &= castle_rights_mask[from] & castle_rights_mask[to];
 */
 
-static int char_to_piece(char lo) {
-    const char* m = "pnbrqk"; /* PAWN=1..KING=6 match i+1 */
-    for (int i = 0; i < 6; i++) if (lo == m[i]) return i + 1;
-    return EMPTY;
+static inline int is_square_attacked(const Position *pos, int sq, int s) {
+    return (pawn_attacks[s ^ 1][sq] & pos->pieces[s][PAWN]) || (knight_attacks[sq] & pos->pieces[s][KNIGHT]) ||
+           (king_attacks[sq] & pos->pieces[s][KING]) || (get_bishop_attacks(sq, pos->occ[BOTH]) & (pos->pieces[s][BISHOP] | pos->pieces[s][QUEEN])) ||
+           (get_rook_attacks(sq, pos->occ[BOTH]) & (pos->pieces[s][ROOK] | pos->pieces[s][QUEEN]));
 }
 
-void parse_fen(const char* fen) {
-    int rank = 7, file = 0;
+static inline int in_check(const Position *pos, int side) { return is_square_attacked(pos, lsb(pos->pieces[side][KING]), side ^ 1); }
 
-    for (int i = 0; i < 128; i++) board[i] = EMPTY;
-    castle_rights = 0; ep_square = SQ_NONE; ply = 0; hash_key = 0;
-    memset(count, 0, sizeof(count));
-    memset(killers, 0, sizeof(killers)); memset(pv, 0, sizeof(pv));
-    memset(pv_length, 0, sizeof(pv_length)); memset(hist, 0, sizeof(hist));
+static inline u64 compute_attacks(const Position *pos, int side) {
+    u64 p = pos->pieces[side][PAWN];
+    u64 atks = (side == WHITE) ? (((p << 9) & C64(0xFEFEFEFEFEFEFEFE)) | ((p << 7) & C64(0x7F7F7F7F7F7F7F7F)))
+                               : (((p >> 7) & C64(0xFEFEFEFEFEFEFEFE)) | ((p >> 9) & C64(0x7F7F7F7F7F7F7F7F)));
+    for (u64 n = pos->pieces[side][KNIGHT]; n; ) atks |= knight_attacks[pop_lsb(&n)];
+    atks |= king_attacks[lsb(pos->pieces[side][KING])];
+    for (u64 bq = pos->pieces[side][BISHOP] | pos->pieces[side][QUEEN]; bq; ) atks |= get_bishop_attacks(pop_lsb(&bq), pos->occ[BOTH]);
+    for (u64 rq = pos->pieces[side][ROOK] | pos->pieces[side][QUEEN]; rq; ) atks |= get_rook_attacks(pop_lsb(&rq), pos->occ[BOTH]);
+    return atks;
+}
 
-    while (*fen && *fen != ' ') {
-        if (*fen == '/') { file = 0; rank--; }
-        else if (isdigit(*fen)) { file += *fen - '0'; }
-        else {
-            int sq = rank * 16 + file, color = isupper(*fen) ? WHITE : BLACK; char lo = (char)tolower(*fen);
-            int piece = char_to_piece(lo);
-            if (piece == EMPTY) { fen++; continue; }
-            board[sq] = make_piece(color, piece);
-            count[color][piece]++;
-            file++;
+static inline void set_piece(Position *pos, int side, int pt, int sq) {
+    pos->pieces[side][pt] |= bit(sq); pos->occ[side] |= bit(sq); pos->occ[BOTH] |= bit(sq); pos->mailbox[sq] = (uint8_t)pt;
+}
+static inline void clear_piece(Position *pos, int side, int pt, int sq) {
+    pos->pieces[side][pt] &= ~bit(sq); pos->occ[side] &= ~bit(sq); pos->occ[BOTH] &= ~bit(sq); pos->mailbox[sq] = NO_PIECE;
+}
+
+#define CASTLE_WK_OCC (bit(F1) | bit(G1))
+#define CASTLE_WQ_OCC (bit(B1) | bit(C1) | bit(D1))
+#define CASTLE_BK_OCC (bit(F8) | bit(G8))
+#define CASTLE_BQ_OCC (bit(B8) | bit(C8) | bit(D8))
+
+const uint8_t castle_rights_mask[64] = { 13,15,15,15,12,15,15,14, 15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15,  7,15,15,15, 3,15,15,11 };
+
+void make_move(Position *pos, Move m, UndoInfo *undo) {
+    int from = move_from(m), to = move_to(m), flag = move_flag(m);
+    int us = pos->side, them = us ^ 1, pt = pos->mailbox[from], cap = pos->mailbox[to];
+    undo->hash = pos->hash; undo->castling = pos->castling; undo->ep = pos->ep; undo->halfmove = pos->halfmove; undo->captured = cap;
+
+    pos->hash ^= zobrist_side;
+    if (pos->ep != SQ_NONE) pos->hash ^= zobrist_ep[pos->ep];
+    pos->ep = SQ_NONE;
+    pos->halfmove = (pt == PAWN || cap != NO_PIECE) ? 0 : pos->halfmove + 1;
+
+    Accumulator *src = &nnue.stack[acc_ply], *dst = &nnue.stack[acc_ply + 1];
+
+    if (flag == FLAG_CASTLE) {
+        clear_piece(pos, us, KING, from); set_piece(pos, us, KING, to);
+        pos->hash ^= zobrist_piece[us][KING][from] ^ zobrist_piece[us][KING][to];
+        int rf = (to == G1) ? H1 : (to == C1) ? A1 : (to == G8) ? H8 : A8;
+        int rt = (to == G1) ? F1 : (to == C1) ? D1 : (to == G8) ? F8 : D8;
+        clear_piece(pos, us, ROOK, rf); set_piece(pos, us, ROOK, rt);
+        pos->hash ^= zobrist_piece[us][ROOK][rf] ^ zobrist_piece[us][ROOK][rt];
+        if (nnue.loaded) nnue_add2sub2(dst, src, us, KING, to, us, ROOK, rt, us, KING, from, us, ROOK, rf);
+    } else if (flag == FLAG_EP) {
+        clear_piece(pos, us, PAWN, from); set_piece(pos, us, PAWN, to);
+        int ep_cap_sq = (us == WHITE) ? to - 8 : to + 8;
+        clear_piece(pos, them, PAWN, ep_cap_sq);
+        pos->hash ^= zobrist_piece[us][PAWN][from] ^ zobrist_piece[us][PAWN][to] ^ zobrist_piece[them][PAWN][ep_cap_sq];
+        if (nnue.loaded) nnue_add1sub2(dst, src, us, PAWN, to, us, PAWN, from, them, PAWN, ep_cap_sq);
+    } else {
+        if (cap != NO_PIECE) { clear_piece(pos, them, cap, to); pos->hash ^= zobrist_piece[them][cap][to]; }
+        clear_piece(pos, us, pt, from); pos->hash ^= zobrist_piece[us][pt][from];
+        int final_pt = (flag >= FLAG_PROMO_N) ? promo_piece(flag) : pt;
+        set_piece(pos, us, final_pt, to); pos->hash ^= zobrist_piece[us][final_pt][to];
+        if (flag == FLAG_DOUBLE_PUSH) { pos->ep = (us == WHITE) ? from + 8 : from - 8; pos->hash ^= zobrist_ep[pos->ep]; }
+        if (nnue.loaded) {
+            if (cap != NO_PIECE) nnue_add1sub2(dst, src, us, final_pt, to, us, pt, from, them, cap, to);
+            else nnue_add1sub1(dst, src, us, final_pt, to, us, pt, from);
         }
-        fen++;
     }
-    if (*fen) fen++;
 
-    side = (*fen == 'w') ? WHITE : BLACK; xside = side ^ 1;
-    if (*fen) fen++;
-    if (*fen) fen++;
-
-    while (*fen && *fen != ' ') {
-        if (*fen == 'K') { castle_rights |= 1; } if (*fen == 'Q') { castle_rights |= 2; }
-        if (*fen == 'k') { castle_rights |= 4; } if (*fen == 'q') { castle_rights |= 8; }
-        fen++;
-    }
-    if (*fen) fen++;
-
-    if (*fen != '-' && *fen && fen[1])
-        ep_square = (fen[1] - '1') * 16 + (fen[0] - 'a');
-
-    /* advance past ep field, then read halfmove clock */
-    while (*fen && *fen != ' ') fen++;
-    halfmove_clock = 0;
-    if (*fen == ' ') { fen++; halfmove_clock = atoi(fen); }
-
-    set_list();
+    acc_ply++;
+    pos->hash ^= zobrist_castle[pos->castling];
+    pos->castling &= castle_rights_mask[from] & castle_rights_mask[to];
+    pos->hash ^= zobrist_castle[pos->castling];
+    pos->side ^= 1;
 }
 
-/* ===============================================================
-   S9  EVALUATION
-   ===============================================================
+void undo_move(Position *pos, Move m, const UndoInfo *undo) {
+    acc_ply--; pos->side ^= 1;
+    int from = move_from(m), to = move_to(m), flag = move_flag(m);
+    int us = pos->side, them = us ^ 1;
+    pos->hash = undo->hash; pos->castling = undo->castling; pos->ep = undo->ep; pos->halfmove = undo->halfmove;
 
-   Idea
-   A static evaluator scores the position in centipawns from the
-   side-to-move's perspective.  Raw material counting ignores piece
-   activity, so positional bonuses and penalties are layered on top.
+    if (flag == FLAG_CASTLE) {
+        clear_piece(pos, us, KING, to); set_piece(pos, us, KING, from);
+        int rf = (to == G1) ? H1 : (to == C1) ? A1 : (to == G8) ? H8 : A8;
+        int rt = (to == G1) ? F1 : (to == C1) ? D1 : (to == G8) ? F8 : D8;
+        clear_piece(pos, us, ROOK, rt); set_piece(pos, us, ROOK, rf);
+    } else if (flag == FLAG_EP) {
+        clear_piece(pos, us, PAWN, to); set_piece(pos, us, PAWN, from);
+        set_piece(pos, them, PAWN, (us == WHITE) ? to - 8 : to + 8);
+    } else {
+        int final_pt = (flag >= FLAG_PROMO_N) ? promo_piece(flag) : pos->mailbox[to];
+        clear_piece(pos, us, final_pt, to);
+        set_piece(pos, us, (flag >= FLAG_PROMO_N) ? PAWN : final_pt, from);
+        if (undo->captured != NO_PIECE) set_piece(pos, them, undo->captured, to);
+    }
+}
 
-   Implementation (PeSTO tapered evaluation)
-   1. Material + PST: separate middlegame (MG) and endgame (EG) values
-      from Rofchade's Texel-tuned PeSTO tables.  Each piece accumulates
-      into mg[color] and eg[color] arrays independently.
-   2. Phase: each non-pawn piece type contributes to a 0-24 phase
-      counter (knight=1, bishop=1, rook=2, queen=4, max=24).
-      phase=24 is a full middlegame; phase=0 is a pure endgame.
-   3. Taper: the final score blends MG and EG smoothly:
-         (mg_score * phase + eg_score * (24 - phase)) / 24
-      This replaces the old single-score + MAX_PHASE approach and
-      correctly handles all pieces (including the king) in one pass.
-   4. Mobility: centered around typical values so inactive pieces are
-      penalised rather than all pieces receiving a flat bonus.
-   5. Pawn structure: doubled and isolated pawns penalised in both
-      MG and EG.  Passed pawns are NOT added explicitly -- PeSTO's EG
-      pawn table already encodes their value; double-counting hurts.
-   6. Pawn shield: MG-only, since king centralisation in the endgame
-      is handled by the EG king PST directly.
-   7. Rook activity: open/semi-open file and 7th-rank bonuses applied
-      to both MG and EG.
+/* ================================================================
+   S6  MOVE GENERATION
+   ================================================================
+
+   A chess move is legal if the moving piece follows the rules and
+   does not leave its own king in check. Testing for absolute pins
+   and check evasions during generation is intricate and slow.
+   Instead, `generate_moves` produces "pseudo-legal" moves: moves
+   that obey the geometry of the piece regardless of pins. The
+   search plays each candidate:
+     make_move(pos, m, &undo);
+     if (!in_check(pos, pos->side ^ 1)) { ... legal ... }
+     undo_move(pos, m, &undo);
+   and immediately discards any move that leaves the king exposed.
+   Because most positions have few or no pinned pieces, this test
+   after the fact is much faster than checking pins up front.
+
+   The generator accepts a mode parameter to restrict output:
+     0  All pseudo-legal moves, used in regular alpha-beta search.
+     1  Captures and promotions only, used in quiescence search.
+     2  Quiet moves only.
+
+   The target mask (`opp_or_empty`) determines valid destination
+   squares in a single bitwise operation:
+     Mode 1 : pos->occ[them]   (enemy-occupied squares only)
+     Mode 2 : ~pos->occ[BOTH]  (empty squares only)
+     Mode 0 : ~pos->occ[us]    (any square not holding a friendly piece)
+
+   Pawn moves are generated separately because pawns move and capture
+   differently. We test single pushes into empty squares, double
+   pushes from the starting rank (provided both intervening squares
+   are empty), diagonal captures into enemy squares, en passant
+   captures when an en passant square is active, and expand any move
+   landing on the back rank into four promotions (Q, R, B, N).
+
+   Knights, kings, and sliding pieces (bishops, rooks, queens)
+   generate moves by intersecting their attack bitboards with
+   `opp_or_empty`. We then extract destination squares one by one
+   with `pop_lsb` and append the encoded moves to the move list.
+
+   Castling verifies that the king and chosen rook have not moved,
+   that the squares between them are completely empty, and that the
+   king is not currently in check, does not cross an attacked square,
+   and does not land in check.
 */
 
-/*
-   PeSTO / Rofchade Texel-tuned piece-square tables.
-   Indexed [piece-1][sq] where piece: 0=pawn..5=king.
-   Square index: rank*8+file, rank 0 = White's back rank (rank 1),
-   rank 7 = rank 8.  CPW tables (rank 8 first) are vertically flipped.
-   Black uses (7-rank)*8+file to mirror vertically.
+void generate_moves(const Position *pos, MoveList *list, int mode) {
+    list->count = 0;
+    int us = pos->side, them = us ^ 1, promo_rank = (us == WHITE) ? 7 : 0, start_rank = (us == WHITE) ? 1 : 6;
+    u64 opp_or_empty = (mode == 1) ? pos->occ[them] : (mode == 2) ? ~pos->occ[BOTH] : ~pos->occ[us];
+
+    for (u64 pawns = pos->pieces[us][PAWN]; pawns; ) {
+        int sq = pop_lsb(&pawns), r = sq / 8, single_to = (us == WHITE) ? sq + 8 : sq - 8;
+        if (single_to >= 0 && single_to < 64 && !(pos->occ[BOTH] & bit(single_to))) {
+            if (single_to / 8 == promo_rank) push_promos(list, sq, single_to);
+            else if (mode != 1) {
+                push_move(list, encode_move(sq, single_to, FLAG_QUIET));
+                int double_to = (us == WHITE) ? sq + 16 : sq - 16;
+                if (r == start_rank && !(pos->occ[BOTH] & bit(double_to)))
+                    push_move(list, encode_move(sq, double_to, FLAG_DOUBLE_PUSH));
+            }
+        }
+        if (mode != 2) {
+            for (u64 atks = pawn_attacks[us][sq] & pos->occ[them]; atks; ) {
+                int to = pop_lsb(&atks);
+                if (to / 8 == promo_rank) push_promos(list, sq, to);
+                else push_move(list, encode_move(sq, to, FLAG_QUIET));
+            }
+            if (pos->ep != SQ_NONE && (pawn_attacks[us][sq] & bit(pos->ep)))
+                push_move(list, encode_move(sq, pos->ep, FLAG_EP));
+        }
+    }
+
+    for (u64 n = pos->pieces[us][KNIGHT]; n; ) {
+        int sq = pop_lsb(&n);
+        for (u64 a = knight_attacks[sq] & opp_or_empty; a; ) push_move(list, encode_move(sq, pop_lsb(&a), FLAG_QUIET));
+    }
+    for (u64 bq = pos->pieces[us][BISHOP] | pos->pieces[us][QUEEN]; bq; ) {
+        int sq = pop_lsb(&bq);
+        for (u64 a = get_bishop_attacks(sq, pos->occ[BOTH]) & opp_or_empty; a; ) push_move(list, encode_move(sq, pop_lsb(&a), FLAG_QUIET));
+    }
+    for (u64 rq = pos->pieces[us][ROOK] | pos->pieces[us][QUEEN]; rq; ) {
+        int sq = pop_lsb(&rq);
+        for (u64 a = get_rook_attacks(sq, pos->occ[BOTH]) & opp_or_empty; a; ) push_move(list, encode_move(sq, pop_lsb(&a), FLAG_QUIET));
+    }
+    int ksq = lsb(pos->pieces[us][KING]);
+    for (u64 a = king_attacks[ksq] & opp_or_empty; a; ) push_move(list, encode_move(ksq, pop_lsb(&a), FLAG_QUIET));
+
+    if (mode != 1) {
+        int k = (us == WHITE) ? E1 : E8;
+        int cr_k = (us == WHITE) ? CASTLE_WK : CASTLE_BK, cr_q = (us == WHITE) ? CASTLE_WQ : CASTLE_BQ;
+        u64 occ_k = (us == WHITE) ? CASTLE_WK_OCC : CASTLE_BK_OCC, occ_q = (us == WHITE) ? CASTLE_WQ_OCC : CASTLE_BQ_OCC;
+        if ((pos->castling & cr_k) && !(pos->occ[BOTH] & occ_k) && !is_square_attacked(pos, k, them) && !is_square_attacked(pos, k + 1, them) && !is_square_attacked(pos, k + 2, them))
+            push_move(list, encode_move(k, k + 2, FLAG_CASTLE));
+        if ((pos->castling & cr_q) && !(pos->occ[BOTH] & occ_q) && !is_square_attacked(pos, k, them) && !is_square_attacked(pos, k - 1, them) && !is_square_attacked(pos, k - 2, them))
+            push_move(list, encode_move(k, k - 2, FLAG_CASTLE));
+    }
+}
+
+/* ================================================================
+   S7  SEARCH & HEURISTICS
+   ================================================================
+
+   The search uses the negamax formulation of alpha-beta minimax.
+   Because chess is a zero-sum game, White's advantage is Black's
+   disadvantage. Evaluating every position from the perspective of
+   the side to move reduces the recursive step to a single symmetry:
+     score = -search(-beta, -alpha);
+   Alpha is the lower bound: the best score the mover can guarantee.
+   Beta is the upper bound: the score the opponent can hold them to.
+   If any move returns a score >= beta, the opponent would have avoided
+   this branch earlier in the tree. We cut off search immediately
+   (a "beta cutoff") and ignore the remaining moves.
+
+   Alpha-beta is fastest when the strongest moves are searched first.
+   Move ordering sorts candidates before searching:
+     1. TT move      : The best move found at this position in an
+                       earlier or shallower search iteration.
+     2. Good captures: Captures ordered by MVV-LVA (Most Valuable
+                       Victim, Least Valuable Attacker) and verified
+                       by Static Exchange Evaluation (SEE >= 0).
+     3. Killer moves : Quiet moves that caused a beta cutoff at this
+                       same ply in a sibling branch.
+     4. History      : Butterfly tables tracking quiet moves that
+                       frequently cause cutoffs, indexed by [from][to]
+                       and refined by threat context (whether from/to
+                       squares are under attack).
+
+   Quiescence search (`qsearch`) prevents the "horizon effect", where
+   the engine might stop searching right before a queen is recaptured.
+   It examines only captures and promotions until the board settles.
+   If the current static evaluation ("stand-pat") already meets or
+   exceeds beta, the side to move can simply refuse to capture further,
+   allowing an immediate cutoff.
+
+   Selective pruning and reductions keep the search tree manageable:
+     - Reverse futility : If static eval beats beta by a wide margin
+                          at low depth, return eval immediately.
+     - Razoring         : If static eval is far below alpha near leaf
+                          nodes, verify with a quick qsearch cutoff.
+     - Null-move pruning: Pass our turn to the opponent; if our score
+                          still beats beta at reduced depth, cutoff.
+                          Disabled in king-and-pawn endgames to avoid
+                          zugzwang errors.
+     - Late-move red.   : Moves ordered late in the list are unlikely
+                          to beat alpha. We search them at reduced depth
+                          (LMR), re-searching at full depth only if they
+                          surprise us by beating alpha. Moves that escape
+                          an opponent threat receive less reduction.
+     - Futility & LMP   : Skip late quiet moves entirely at low depths
+                          when winning is unlikely.
+     - Aspiration window: Search with a narrow [score-delta, score+delta]
+                          window around the previous depth's score,
+                          widening only on a fail-high or fail-low.
 */
 
-/* mg_pst[piece-1][sq]: middlegame, 16 vals/line = one rank pair, rank 1 first */
-/* Readable version kept as comments */
-// static int mg_pst[6][64] = {
-//  {  82,   82,   82,   82,   82,   82,   82,   82,      47,  76,    57,   60,   67,  100,  107,   56,  /* pawn   r1-r2 */
-//     56,   71,   78,   74,   87,   87,  104,   70,      53,  77,    78,   96,   99,   88,   90,   55,  /*        r3-r4 */
-//     66,   94,   90,  105,  107,   96,  100,   57,      76,  90,   101,  105,  120,  141,  108,   63,  /*        r5-r6 */
-//    162,  158,  131,  136,  132,  139,  108,   79,      82,  82,    82,   82,   82,   82,   82,   82}, /*        r7-r8 */
+enum { INF = 32000, MATE = 30000, MAX_PLY = 64 };
+static inline int is_tactical(const Position *pos, Move m) { return (pos->mailbox[move_to(m)] != NO_PIECE) || (move_flag(m) >= FLAG_EP); }
 
-//  { 231,  318,  281,  306,  322,  311,  317,  315,     310,  286,  327,  336,  338,  357,  325,  320,  /* knight r1-r2 */
-//    312,  330,  347,  349,  358,  356,  364,  319,     325,  343,  353,  349,  367,  357,  360,  330,  /*        r3-r4 */
-//    330,  355,  355,  392,  372,  407,  354,  360,     290,  398,  374,  400,  422,  465,  411,  379,  /*        r5-r6 */
-//    266,  297,  411,  374,  360,  401,  342,  322,     172,  250,  305,  290,  400,  241,  322,  232}, /*       r7-r8 */
+u64 pos_history[1024];
+int pos_history_count = 0, time_over_flag = 0;
+clock_t search_start_time;
+int64_t search_hard_limit_ms = 0, search_soft_limit_ms = 0;
+u64 nodes_searched = 0;
+Move best_root_move = 0;
 
-//  { 333,  364,  353,  346,  354,  351,  326,  344,     370,  384,  382,  365,  374,  388,  401,  367,  /* bishop r1-r2 */
-//    363,  382,  380,  378,  377,  393,  384,  373,     361,  380,  376,  392,  398,  375,  374,  370,  /*        r3-r4 */
-//    362,  368,  384,  417,  400,  400,  370,  362,     347,  403,  408,  403,  400,  417,  402,  361,  /*        r5-r6 */
-//    339,  382,  348,  353,  397,  425,  385,  318,     338,  370,  283,  329,  342,  325,  373,  358}, /*        r7-r8 */
+static inline void check_time(void) {
+    if (search_hard_limit_ms > 0 && (nodes_searched & 2047) == 0) {
+        if ((int64_t)((clock() - search_start_time) * 1000 / CLOCKS_PER_SEC) >= search_hard_limit_ms)
+            time_over_flag = 1;
+    }
+}
 
-//  { 460,  466,  479,  492,  491,  486,  438,  452,     434,  462,  459,  467,  476,  490,  473,  405,  /* rook   r1-r2 */
-//    433,  454,  461,  460,  478,  479,  474,  443,     439,  453,  464,  474,  486,  471,  483,  452,  /*        r3-r4 */
-//    455,  467,  482,  502,  499,  512,  469,  457,     471,  496,  501,  511,  492,  523,  538,  493,  /*        r5-r6 */
-//    502,  507,  533,  537,  555,  542,  501,  519,     510,  519,  508,  526,  539,  488,  510,  522}, /*        r7-r8 */
- 
-//  {1023, 1008, 1018, 1037, 1012, 1002,  996,  976,     991, 1016, 1036, 1029, 1035, 1042, 1024, 1028,  /* queen  r1-r2 */
-//   1009, 1025, 1012, 1021, 1018, 1025, 1038, 1030,    1014,  997, 1014, 1013, 1021, 1019, 1026, 1020,  /*        r3-r4 */
-//    996,  996, 1007, 1007, 1022, 1040, 1022, 1024,    1014, 1006, 1030, 1031, 1054, 1083, 1072, 1082,  /*        r5-r6 */
-//   1002,  984, 1020, 1028, 1008, 1084, 1054, 1081,     999, 1026, 1056, 1038, 1086, 1071, 1070, 1072}, /*        r7-r8 */
+static inline int is_material_draw(const Position *pos) {
+    if (pos->pieces[WHITE][PAWN] | pos->pieces[BLACK][PAWN] |
+        pos->pieces[WHITE][ROOK] | pos->pieces[BLACK][ROOK] |
+        pos->pieces[WHITE][QUEEN] | pos->pieces[BLACK][QUEEN])
+        return 0;
 
-//  { -17,   36,   14,  -56,    6,  -26,   26,   12,       1,    8,   -6,  -66,  -45,  -14,   11,    7,  /* king   r1-r2 */
-//    -13,  -12,  -20,  -48,  -46,  -28,  -13,  -25,     -48,    1,  -25,  -41,  -48,  -42,  -32,  -53,  /*        r3-r4 */
-//    -16,  -18,  -10,  -29,  -31,  -25,  -13,  -35,      -7,   26,    4,  -17,  -22,    8,   24,  -24,  /*        r5-r6 */
-//     30,    1,  -18,   -5,  -10,   -2,  -36,  -28,     -66,   24,   18,  -14,  -58,  -32,    3,   13}  /*        r7-r8 */
-// };
+    int wn = popcount(pos->pieces[WHITE][KNIGHT]), bn = popcount(pos->pieces[BLACK][KNIGHT]);
+    int wb = popcount(pos->pieces[WHITE][BISHOP]), bb = popcount(pos->pieces[BLACK][BISHOP]);
+    int wm = wn + wb, bm = bn + bb;
 
-/* eg_pst[piece-1][sq]: endgame, same layout */
-// static int eg_pst[6][64] = {
-//   { 94,   94,   94,   94,   94,   94,   94,   94,    108,  100,  102,  102,  106,   92,   94,   85,  /* pawn   r1-r2 */
-//     96,   99,   86,   94,   94,   89,   91,   84,    105,  101,   89,   85,   85,   84,   95,   91,  /*        r3-r4 */
-//    124,  116,  105,   97,   90,   96,  109,  109,    166,  163,  140,  119,  118,  125,  146,  156,  /*        r5-r6 */
-//    189,  186,  180,  156,  159,  182,  187,  218,     94,   94,   94,   94,   94,   94,   94,   94}, /*        r7-r8 */
+    if (wm == 0 && bm <= 1) return 1;
+    if (bm == 0 && wm <= 1) return 1;
+    if (wm == 1 && bm == 1) return 1;
+    if (wm == 2 && wn == 2 && bm == 0) return 1;
+    if (bm == 2 && bn == 2 && wm == 0) return 1;
+    return 0;
+}
 
-//   {254,  232,  260,  268,  261,  265,  233,  219,    241,  263,  273,  278,  281,  263,  260,  239,  /* knight r1-r2 */
-//    260,  279,  280,  297,  293,  279,  263,  261,    265,  277,  299,  308,  298,  298,  287,  265,  /*        r3-r4 */
-//    266,  286,  305,  305,  305,  293,  291,  261,    259,  263,  290,  291,  278,  270,  262,  239,  /*        r5-r6 */
-//    258,  275,  257,  281,  272,  254,  255,  231,    225,  245,  270,  255,  251,  256,  220,  183}, /*        r7-r8 */
+static inline int is_draw(const Position *pos, int ply) {
+    if (pos->halfmove >= 100 || is_material_draw(pos)) return 1;
+    if (ply > 0) {
+        int limit = (pos->halfmove < pos_history_count - 1) ? pos->halfmove : pos_history_count - 1;
+        for (int i = 2; i <= limit; i += 2) {
+            if (i > ply && i < 4) continue;
+            if (pos_history[pos_history_count - 1 - i] == pos->hash) return 1;
+        }
+    }
+    return 0;
+}
 
-//   {276,  290,  276,  294,  290,  283,  294,  282,    285,  281,  292,  298,  302,  290,  284,  271,  /* bishop r1-r2 */
-//    287,  296,  307,  307,  312,  299,  292,  284,    293,  301,  311,  317,  304,  306,  295,  290,  /*        r3-r4 */
-//    296,  308,  310,  306,  311,  305,  301,  301,    301,  290,  297,  297,  297,  303,  299,  303,  /*        r5-r6 */
-//    291,  295,  306,  287,  295,  286,  293,  285,    285,  278,  288,  291,  292,  290,  282,  275}, /*        r7-r8 */
+enum {
+    SCORE_ROOT_PV = 300000, SCORE_TT_MOVE = 200000, SCORE_PROMO_BASE = 60000, SCORE_CAPTURE_BASE = 40000,
+    SCORE_KILLER_1 = 25000, SCORE_KILLER_2 = 20000, MAX_HISTORY = 16384, MAX_BONUS = 2000,
+    SEE_PRUNING_MAX_DEPTH = 3, SEE_PRUNING_NOISY_MARGIN = -120, SEE_PRUNING_QUIET_MARGIN = -60,
+    RFP_MAX_DEPTH = 6, RFP_MARGIN = 75, NMP_MIN_DEPTH = 3, NMP_EVAL_MARGIN = 30,
+    FP_MAX_DEPTH = 3, FP_MARGIN = 90, LMP_MAX_DEPTH = 5, HP_MAX_DEPTH = 4, HP_MARGIN = 2048,
+    RAZORING_MAX_DEPTH = 3, RAZORING_MARGIN = 150
+};
 
-//   {506,  517,  518,  512,  510,  502,  519,  495,    509,  509,  515,  517,  506,  506,  504,  512,  /* rook   r1-r2 */
-//    511,  515,  510,  514,  508,  503,  507,  499,    518,  520,  523,  516,  509,  509,  507,  504,  /*        r3-r4 */
-//    519,  518,  528,  513,  513,  516,  513,  517,    522,  522,  520,  517,  517,  512,  510,  512,  /*        r5-r6 */
-//    522,  524,  524,  522,  508,  514,  519,  514,    528,  524,  533,  526,  525,  527,  523,  520}, /*        r7-r8 */
-
-//   {904,  910,  916,  896,  934,  906,  919,  897,    917,  916,  909,  922,  922,  916,  903,  906,  /* queen  r1-r2 */
-//    923,  911,  952,  944,  947,  955,  949,  944,    920,  967,  956,  985,  967,  973,  976,  962,  /*        r3-r4 */
-//    941,  960,  960,  983,  996,  977,  996,  975,    918,  943,  946,  987,  986,  974,  956,  948,  /*        r5-r6 */
-//    921,  959,  970,  980,  997,  964,  969,  938,    930,  961,  960,  966,  966,  958,  949,  959}, /*        r7-r8 */
-  
-//   {-55,  -36,  -19,  -12,  -30,  -12,  -26,  -45,    -28,   -9,    6,   11,   12,    6,   -3,  -19,  /* king   r1-r2 */
-//    -21,   -1,   13,   19,   21,   18,    9,  -10,    -19,   -3,   23,   22,   25,   25,   11,  -12,  /*        r3-r4 */
-//    -10,   24,   26,   25,   24,   35,   28,    1,     10,   18,   24,   13,   18,   46,   45,   11,  /*        r5-r6 */
-//    -12,   19,   16,   16,   15,   40,   25,   12,    -74,  -34,  -18,  -20,  -13,   17,    5,  -19}  /*        r7-r8 */
-// };
-
-static int mg_pst[6][64] = { {82,82,82,82,82,82,82,82, 71,72,75,75,87,100,107,63, 75,75,85,90,106,100,105,81, 75,81,94,109,113,109,97,77, 84,95,103,122,132,131,111,94, 94,112,140,140,160,177,149,103, 234,211,183,200,185,164,66,63, 82,82,82,82,82,82,82,82}, {265,320,302,322,326,338,321,293, 305,312,339,353,349,354,336,339, 319,342,358,371,380,365,363,325, 334,343,375,371,384,375,383,346, 347,363,391,415,386,412,369,379, 318,379,407,420,443,474,410,371, 313,318,385,394,387,434,335,356, 169,259,256,310,384,187,361,241}, {360,365,362,346,351,362,366,353, 375,376,382,364,374,381,398,373, 362,379,373,376,377,378,376,378, 355,366,372,394,390,365,365,373, 348,374,380,410,390,389,373,364, 355,386,380,389,416,415,412,388, 340,359,362,336,362,383,362,354, 318,299,276,267,277,252,364,341}, {461,459,463,472,476,481,475,472, 433,439,449,457,466,481,486,426, 432,434,436,450,454,458,484,458, 430,430,433,444,449,459,466,452, 440,447,455,475,475,489,485,482, 451,473,476,484,510,534,569,492, 469,467,488,503,499,545,521,533, 505,494,484,490,501,486,551,559}, {1076,1066,1083,1095,1089,1071,1059,1060, 1067,1079,1092,1092,1093,1102,1105,1085, 1061,1080,1079,1078,1085,1085,1088,1090, 1061,1058,1069,1063,1071,1075,1084,1082, 1056,1053,1053,1066,1067,1073,1084,1089, 1051,1050,1056,1050,1100,1146,1150,1106, 1045,1017,1043,1037,1046,1117,1074,1133, 1038,1051,1058,1099,1097,1138,1166,1159}, {-25,12,8,-91,12,-72,6,10, 7,-31,-38,-72,-50,-54,-10,4, -43,-38,-55,-91,-75,-68,-46,-52, -77,-26,-39,-107,-97,-72,-63,-84, -33,7,-15,-74,-74,-6,-43,-79, -30,44,30,-38,2,99,74,-21, 21,42,87,-8,22,56,24,61, 117,133,103,19,-7,22,164,146} };
-static int eg_pst[6][64] = { {94,94,94,94,94,94,94,94, 125,121,120,116,119,121,109,109, 116,114,107,107,106,109,104,103, 123,118,103,94,95,104,108,108, 135,127,115,98,100,103,118,116, 168,162,143,125,115,121,134,146, 225,236,236,212,212,209,236,241, 94,94,94,94,94,94,94,94}, {276,297,340,345,342,332,313,284, 310,348,350,354,359,345,344,320, 328,358,363,379,378,360,355,337, 357,374,389,397,395,390,370,353, 359,375,391,397,401,395,382,354, 355,363,379,385,374,370,361,341, 339,369,362,378,373,342,356,330, 314,351,384,363,356,387,332,274}, {350,363,359,374,373,368,355,355, 358,357,363,370,370,362,361,346, 369,378,380,374,385,375,373,361, 376,384,385,381,376,385,381,375, 381,387,382,381,385,383,391,384, 380,382,380,379,376,384,381,382, 376,380,383,386,385,377,377,369, 382,391,391,397,395,393,381,376}, {638,639,644,639,631,636,631,620, 638,642,646,638,635,624,621,634, 644,653,651,645,643,644,631,627, 665,668,668,664,659,655,651,648, 676,673,673,667,663,663,661,657, 680,674,676,668,658,655,644,663, 680,683,678,674,674,656,665,655, 657,668,672,666,667,675,658,655}, {1132,1134,1125,1119,1117,1115,1113,1124, 1140,1141,1127,1137,1135,1117,1103,1103, 1152,1145,1169,1159,1166,1170,1166,1155, 1160,1194,1182,1211,1197,1209,1196,1203, 1177,1205,1216,1220,1236,1245,1230,1222, 1188,1204,1211,1243,1231,1224,1207,1238, 1202,1236,1245,1261,1277,1227,1240,1193, 1220,1227,1234,1214,1232,1215,1189,1189}, {-40,-27,-18,-10,-48,-4,-30,-63, -21,1,10,3,2,11,-6,-24, -12,11,22,21,20,22,8,-10, -6,11,28,35,34,35,21,2, 2,24,36,30,36,37,40,16, 15,24,28,21,10,33,41,21, -13,20,9,-3,7,29,44,-15, -111,-44,-34,-35,-22,12,-14,-70} };
+Move killers[2][MAX_PLY];
+int history[2][64][64][2][2], lmr_table[64][64];
+Move root_best_move = 0;
 
 static void init_lmr(void) {
-    for (int d = 1; d < 32; d++)
+    for (int d = 1; d < 64; d++)
         for (int m = 1; m < 64; m++) {
-            int r = (int)round(log(d) * log(m) / 1.6);
-            lmr_table[d][m] = r < 1 ? 1 : r > 5 ? 5 : r;
+            double r = log((double)d) * log((double)m) / 2.1350 + 0.2319;
+            lmr_table[d][m] = r < 0.0 ? 0 : (int)r;
         }
+    lmr_table[0][0] = lmr_table[0][1] = lmr_table[1][0] = lmr_table[1][1] = 0;
 }
 
-/* Phase contribution per piece type (indexed by TYPE(): 1=pawn..6=king).
-   knight=1, bishop=1, rook=2, queen=4; max total = 24. */
-static const int phase_inc[7] = { 0, 0, 1, 1, 2, 4, 0 };
+typedef struct { int count; Move moves[MAX_PLY]; } PVLine;
+static inline void pvline_clear(PVLine *pv) { pv->count = 0; }
+static inline void pvline_update(PVLine *pv, Move m, const PVLine *child) {
+    pv->moves[0] = m;
+    int len = child ? child->count : 0;
+    if (len > MAX_PLY - 1) len = MAX_PLY - 1;
+    if (len > 0) memcpy(&pv->moves[1], child->moves, len * sizeof(Move));
+    pv->count = 1 + len;
+}
 
-/* Piece value table for MVV-LVA move ordering (unchanged) */
-static const int piece_val[7] = { 0,100,320,330,500,900,20000 };
+static inline void print_score(int s) {
+    if (s > MATE - 512) printf("score mate %d ", (MATE - s + 1) / 2);
+    else if (s < -MATE + 512) printf("score mate %d ", -(MATE + s + 1) / 2);
+    else printf("score cp %d ", s);
+}
 
-/* Mobility centering offsets: subtract typical reachable-square count so
-   inactive pieces are penalised rather than all pieces getting a flat bonus.
-   Indexed by TYPE(): 0=empty,1=pawn,2=knight,3=bishop,4=rook,5=queen,6=king */
-static const int mob_center[7] = { 0, 0, 4, 6, 6, 13, 0 };
-static const int mob_step_mg[7] = { 0, 0, 0, 5, 3, 2, 0 };
-static const int mob_step_eg[7] = { 0, 0, 1, 5, 3, 5, 0 };
+static inline int history_bonus(int d) { int b = d * d; return b > MAX_BONUS ? MAX_BONUS : b; }
+static inline void update_history(int side, int from, int to, int src_th, int dst_th, int bonus) {
+    int cl = bonus > MAX_BONUS ? MAX_BONUS : (bonus < -MAX_BONUS ? -MAX_BONUS : bonus);
+    int cur = history[side][from][to][src_th][dst_th];
+    history[side][from][to][src_th][dst_th] = cur + cl - (cur * (cl < 0 ? -cl : cl)) / MAX_HISTORY;
+}
 
-static inline int max(int a, int b) { return a > b ? a : b; }
-static inline int min(int a, int b) { return a < b ? a : b; }
-static inline int distance(int s1, int s2) { return max(abs((s1 & 7) - (s2 & 7)), abs((s1 >> 4) - (s2 >> 4))); }
-static inline void add_score(int* mg, int* eg, int color, int mg_v, int eg_v) { mg[color] += mg_v; eg[color] += eg_v; }
+static const int mvv_lva[7][7] = {
+    { 15, 14, 13, 12, 11, 10, 0 }, { 25, 24, 23, 22, 21, 20, 0 },
+    { 35, 34, 33, 32, 31, 30, 0 }, { 45, 44, 43, 42, 41, 40, 0 },
+    { 55, 54, 53, 52, 51, 50, 0 }, { 0 }, { 0 }
+};
 
-int evaluate(void) {
-    int mg[2], eg[2], phase;
-    int lowest_pawn_rank[2][8];
+static inline int score_move(const Position *pos, Move m, int ply, u64 opp_threats) {
+    if (ply == 0 && m == root_best_move) return SCORE_ROOT_PV;
+    int from = move_from(m), to = move_to(m), flag = move_flag(m);
+    int cap = (flag == FLAG_EP) ? PAWN : pos->mailbox[to], pt = pos->mailbox[from];
+    if (flag >= FLAG_PROMO_N) return SCORE_PROMO_BASE + (flag - FLAG_PROMO_N + 1) * 100;
+    if (cap != NO_PIECE) return SCORE_CAPTURE_BASE + mvv_lva[cap][pt];
+    if (ply < MAX_PLY) {
+        if (m == killers[0][ply]) return SCORE_KILLER_1;
+        if (m == killers[1][ply]) return SCORE_KILLER_2;
+    }
+    return history[pos->side][from][to][(opp_threats & bit(from)) != 0][(opp_threats & bit(to)) != 0];
+}
 
-    /* Combined list of pawns and rooks -- the only pieces needing a second pass.
-       Pawns need full pawn structure info; rooks need open-file data.
-       All other pieces are fully scored in the first pass.                       */
-    int pr_list[32], pr_index = 0, i;
+static const int see_values[7] = { 100, 300, 300, 500, 900, 0, 0 };
 
-    mg[WHITE] = mg[BLACK] = eg[WHITE] = eg[BLACK] = phase = 0;
-    for (int i = 0; i < 8; i++) lowest_pawn_rank[WHITE][i] = lowest_pawn_rank[BLACK][i] = 7;
+static inline u64 attacks_to_square(const Position *pos, int sq, u64 occ) {
+    u64 wp = pos->pieces[WHITE][PAWN], bp = pos->pieces[BLACK][PAWN];
+    u64 n = pos->pieces[WHITE][KNIGHT] | pos->pieces[BLACK][KNIGHT];
+    u64 k = pos->pieces[WHITE][KING] | pos->pieces[BLACK][KING];
+    u64 bq = pos->pieces[WHITE][BISHOP] | pos->pieces[BLACK][BISHOP] | pos->pieces[WHITE][QUEEN] | pos->pieces[BLACK][QUEEN];
+    u64 rq = pos->pieces[WHITE][ROOK] | pos->pieces[BLACK][ROOK] | pos->pieces[WHITE][QUEEN] | pos->pieces[BLACK][QUEEN];
+    return (pawn_attacks[BLACK][sq] & wp) | (pawn_attacks[WHITE][sq] & bp) |
+           (knight_attacks[sq] & n) | (king_attacks[sq] & k) |
+           (get_bishop_attacks(sq, occ) & bq) | (get_rook_attacks(sq, occ) & rq);
+}
 
-    /* First pass: material, PST, phase, mobility.
-       Pawns and rooks are also recorded into pr_list for the second pass. */
-    for (int slot = 0; slot < 32; slot++) {
-        int sq = list_square[slot];
-        if (sq == LIST_OFF) continue;
+int see_ge(const Position *pos, Move m, int threshold) {
+    int flag = move_flag(m);
+    if (flag == FLAG_CASTLE) return threshold <= 0;
 
-        int pt = list_piece[slot], color = list_slot_color(slot);
-        int rank = sq >> 4, f = sq & 7;
+    int from_sq = move_from(m), to_sq = move_to(m), moving_piece = pos->mailbox[from_sq];
+    int captured = (flag == FLAG_EP) ? PAWN : pos->mailbox[to_sq];
+    int promo = (flag >= FLAG_PROMO_N) ? promo_piece(flag) : NO_PIECE;
 
-        if (pt == PAWN) {
-            int own_rank = (color == WHITE) ? rank : (7 - rank);
-            if (own_rank < lowest_pawn_rank[color][f])
-                lowest_pawn_rank[color][f] = own_rank;
-            pr_list[pr_index++] = sq;
-        } else if (pt == ROOK) {
-            pr_list[pr_index++] = sq;
+    int score = ((captured != NO_PIECE) ? see_values[captured] : 0) - threshold;
+
+    if (promo != NO_PIECE) {
+        score += see_values[promo] - see_values[PAWN];
+        if (score < 0) return 0;
+        score -= see_values[promo];
+        if (score >= 0) return 1;
+    } else {
+        if (score < 0) return 0;
+        score -= see_values[moving_piece];
+        if (score >= 0) return 1;
+    }
+
+    u64 occ = pos->occ[BOTH] ^ bit(from_sq) ^ bit(to_sq);
+    if (flag == FLAG_EP) occ ^= bit((pos->side == WHITE) ? to_sq - 8 : to_sq + 8);
+
+    u64 diag = pos->pieces[WHITE][BISHOP] | pos->pieces[BLACK][BISHOP] | pos->pieces[WHITE][QUEEN] | pos->pieces[BLACK][QUEEN];
+    u64 straight = pos->pieces[WHITE][ROOK] | pos->pieces[BLACK][ROOK] | pos->pieces[WHITE][QUEEN] | pos->pieces[BLACK][QUEEN];
+
+    u64 attackers = attacks_to_square(pos, to_sq, occ) & occ;
+    int stm = pos->side ^ 1;
+
+    while (1) {
+        u64 our_attackers = attackers & pos->occ[stm];
+        if (!our_attackers) break;
+
+        int next_piece = NO_PIECE;
+        u64 least_attacker_bb = 0;
+
+        for (int pt = PAWN; pt <= KING; pt++) {
+            u64 bb = our_attackers & pos->pieces[stm][pt];
+            if (bb) { least_attacker_bb = bit(lsb(bb)); next_piece = pt; break; }
         }
 
-        /* Square index: rank 0 = White's back rank.
-           Black mirrors vertically so its rank 0 is rank 7 in White terms. */
-        int idx = (color == WHITE) ? rank * 8 + f : (7 - rank) * 8 + f;
+        if (next_piece == KING && (attackers & pos->occ[stm ^ 1])) break;
 
-        /* Material + PST: scored into MG and EG accumulators separately.
-           pt-1 converts TYPE() (1-based) to the 0-based table index. */
-        add_score(mg, eg, color, mg_pst[pt - 1][idx], eg_pst[pt - 1][idx]);
-        phase += phase_inc[pt];
+        occ ^= least_attacker_bb;
+        if (next_piece == PAWN || next_piece == BISHOP || next_piece == QUEEN)
+            attackers |= get_bishop_attacks(to_sq, occ) & diag;
+        if (next_piece == ROOK || next_piece == QUEEN)
+            attackers |= get_rook_attacks(to_sq, occ) & straight;
+        attackers &= occ;
 
-        /* Mobility: count pseudo-legal reachable squares, centered so that
-           a piece with exactly mob_center[pt] squares scores zero.
-           Pinned pieces appear more mobile than they are, but the
-           approximation is cheap and consistently directional. */
-        if (pt >= KNIGHT && pt <= QUEEN) {
-            int mob = 0;
-            for (i = piece_offsets[pt]; i < piece_limits[pt]; i++) {
-                int step = step_dir[i], target = sq + step;
-                while (!sq_is_off(target)) {
-                    if (is_empty(target)) { mob++; }
-                    else { if (color_on(target) != color) mob++; break; }
-                    if (pt == KNIGHT) break;
-                    target += step;
+        score = -score - 1 - see_values[next_piece];
+        stm ^= 1;
+        if (score >= 0) break;
+    }
+
+    return stm != pos->side;
+}
+
+int qsearch(Position *pos, int alpha, int beta, int ply) {
+    nodes_searched++; check_time();
+    if (time_over_flag) return 0;
+    if (ply > 0 && is_draw(pos, ply)) return 0;
+    if (ply >= MAX_PLY - 1) return in_check(pos, pos->side) ? 0 : nnue_evaluate(pos);
+
+    int is_pv = (beta - alpha > 1), tt_score = 0;
+    Move tt_move = 0;
+    if (tt_probe(pos->hash, 0, alpha, beta, ply, &tt_move, &tt_score, NULL) && !is_pv && ply > 0)
+        return tt_score;
+
+    int check = in_check(pos, pos->side), best_score = -INF, old_alpha = alpha;
+
+    if (!check) {
+        int stand_pat = nnue_evaluate(pos);
+        if (stand_pat >= beta) return stand_pat;
+        if (stand_pat > alpha) alpha = stand_pat;
+        best_score = stand_pat;
+    }
+
+    MoveList list;
+    generate_moves(pos, &list, check ? 0 : 1);
+
+    int scores[256];
+    for (int i = 0; i < list.count; i++)
+        scores[i] = (list.moves[i] == tt_move) ? SCORE_TT_MOVE : score_move(pos, list.moves[i], ply, 0);
+
+    UndoInfo undo;
+    int legal = 0;
+    Move best_move = 0;
+
+    for (int i = 0; i < list.count; i++) {
+        int best_idx = i;
+        for (int j = i + 1; j < list.count; j++)
+            if (scores[j] > scores[best_idx]) best_idx = j;
+        if (best_idx != i) {
+            int ts = scores[i]; scores[i] = scores[best_idx]; scores[best_idx] = ts;
+            Move tm = list.moves[i]; list.moves[i] = list.moves[best_idx]; list.moves[best_idx] = tm;
+        }
+
+        Move m = list.moves[i];
+        if (!check && !see_ge(pos, m, 0)) continue;
+
+        make_move(pos, m, &undo);
+        if (!in_check(pos, pos->side ^ 1)) {
+            legal++;
+            pos_history[pos_history_count++] = pos->hash;
+            int score = -qsearch(pos, -beta, -alpha, ply + 1);
+            pos_history_count--;
+            undo_move(pos, m, &undo);
+
+            if (time_over_flag) return 0;
+            if (score > best_score) { best_score = score; best_move = m; }
+            if (score >= beta) { tt_store(pos->hash, 0, score, TT_BETA, m, ply); return score; }
+            if (score > alpha) alpha = score;
+            continue;
+        }
+        undo_move(pos, m, &undo);
+    }
+
+    if (check && legal == 0) return -(MATE - ply);
+    if (!time_over_flag) tt_store(pos->hash, 0, best_score, (best_score <= old_alpha) ? TT_ALPHA : TT_EXACT, best_move, ply);
+    return best_score;
+}
+
+int search(Position *pos, int depth, int alpha, int beta, int ply, PVLine *pv, int was_null) {
+    if (pv) pvline_clear(pv);
+    check_time();
+    if (time_over_flag) return 0;
+    if (ply >= MAX_PLY - 1) return nnue_evaluate(pos);
+    if (ply > 0 && is_draw(pos, ply)) return 0;
+
+    /* Mate distance pruning */
+    if (ply > 0) {
+        int r_alpha = (alpha > -MATE + ply) ? alpha : -MATE + ply;
+        int r_beta  = (beta < MATE - ply - 1) ? beta : MATE - ply - 1;
+        if (r_alpha >= r_beta) return r_alpha;
+        alpha = r_alpha; beta = r_beta;
+    }
+
+    int in_chk = in_check(pos, pos->side);
+    if (in_chk && ply > 0) depth++;
+
+    int is_pv = (beta - alpha > 1), tt_score = 0, tt_bound = TT_NONE;
+    Move tt_move = 0;
+    if (tt_probe(pos->hash, depth, alpha, beta, ply, &tt_move, &tt_score, &tt_bound) && !is_pv && ply > 0)
+        return tt_score;
+
+    /* Internal Iterative Reductions (IIR) */
+    if (depth >= 4 && !tt_move && !in_chk) depth--;
+    if (depth <= 0) return qsearch(pos, alpha, beta, ply);
+    nodes_searched++;
+
+    int static_eval = in_chk ? -INF : nnue_evaluate(pos);
+
+    /* TT Evaluation Bound Refinement */
+    if (tt_bound != TT_NONE) {
+        if ((tt_bound == TT_BETA || tt_bound == TT_EXACT) && tt_score > static_eval) static_eval = tt_score;
+        else if ((tt_bound == TT_ALPHA || tt_bound == TT_EXACT) && tt_score < static_eval) static_eval = tt_score;
+    }
+
+    /* Reverse Futility Pruning (RFP) */
+    if (!is_pv && ply > 0 && !in_chk && depth <= RFP_MAX_DEPTH && beta < MATE - MAX_PLY) {
+        int margin = RFP_MARGIN * depth;
+        if (static_eval - margin >= beta) return static_eval - margin;
+    }
+
+    /* Razoring */
+    if (!is_pv && ply > 0 && !in_chk && depth <= RAZORING_MAX_DEPTH && alpha > -MATE + MAX_PLY) {
+        if (static_eval + RAZORING_MARGIN * depth <= alpha) {
+            int razor_score = qsearch(pos, alpha, beta, ply);
+            if (time_over_flag) return 0;
+            if (razor_score <= alpha) return razor_score;
+        }
+    }
+
+    /* Null Move Pruning (NMP) */
+    if (!is_pv && ply > 0 && !was_null && !in_chk && depth >= NMP_MIN_DEPTH && beta < MATE - MAX_PLY) {
+        u64 non_pawns = pos->pieces[pos->side][KNIGHT] | pos->pieces[pos->side][BISHOP] | pos->pieces[pos->side][ROOK] | pos->pieces[pos->side][QUEEN];
+        if (non_pawns && static_eval >= beta + NMP_EVAL_MARGIN) {
+            int R = 3 + depth / 4 + (static_eval - beta) / 200;
+            if (R > 6) R = 6;
+
+            int ep_prev = pos->ep;
+            pos->hash ^= zobrist_side;
+            if (pos->ep != SQ_NONE) pos->hash ^= zobrist_ep[pos->ep];
+            pos->ep = SQ_NONE;
+            pos->side ^= 1;
+            pos_history[pos_history_count++] = pos->hash;
+
+            int null_score = -search(pos, depth - 1 - R, -beta, -beta + 1, ply + 1, NULL, 1);
+
+            pos_history_count--;
+            pos->side ^= 1;
+            pos->ep = ep_prev;
+            if (pos->ep != SQ_NONE) pos->hash ^= zobrist_ep[pos->ep];
+            pos->hash ^= zobrist_side;
+
+            if (time_over_flag) return 0;
+            if (null_score >= beta) return null_score >= (MATE - MAX_PLY) ? beta : null_score;
+        }
+    }
+
+    MoveList list;
+    generate_moves(pos, &list, 0);
+
+    u64 opp_threats = compute_attacks(pos, pos->side ^ 1);
+
+    int scores[256];
+    for (int i = 0; i < list.count; i++)
+        scores[i] = (list.moves[i] == tt_move) ? SCORE_TT_MOVE : score_move(pos, list.moves[i], ply, opp_threats);
+
+    Move quiets[256], best_move = 0;
+    int num_quiets = 0, best_score = -INF, bound = TT_ALPHA, legal = 0;
+    UndoInfo undo;
+
+    for (int i = 0; i < list.count; i++) {
+        int best_idx = i;
+        for (int j = i + 1; j < list.count; j++)
+            if (scores[j] > scores[best_idx]) best_idx = j;
+        if (best_idx != i) {
+            int ts = scores[i]; scores[i] = scores[best_idx]; scores[best_idx] = ts;
+            Move tm = list.moves[i]; list.moves[i] = list.moves[best_idx]; list.moves[best_idx] = tm;
+        }
+
+        Move m = list.moves[i];
+        int from = move_from(m), to = move_to(m);
+        int src_th = (opp_threats & bit(from)) != 0, dst_th = (opp_threats & bit(to)) != 0;
+        int is_noisy = is_tactical(pos, m);
+        int is_killer = (ply < MAX_PLY && (m == killers[0][ply] || m == killers[1][ply]));
+        int hist = history[pos->side][from][to][src_th][dst_th];
+
+        /* History Pruning */
+        if (!is_pv && !in_chk && depth <= HP_MAX_DEPTH && best_score > -INF && !is_noisy && !is_killer && hist < -HP_MARGIN * (depth - 1))
+            continue;
+
+        /* Late Move Pruning */
+        if (!is_pv && !in_chk && depth <= LMP_MAX_DEPTH && best_score > -INF && !is_noisy && legal >= 3 + depth * depth)
+            continue;
+
+        /* Futility Pruning */
+        if (!is_pv && !in_chk && depth <= FP_MAX_DEPTH && best_score > -INF && !is_noisy && static_eval + FP_MARGIN * depth <= alpha)
+            continue;
+
+        /* SEE Pruning */
+        if (!in_chk && depth <= SEE_PRUNING_MAX_DEPTH && best_score > -INF) {
+            int margin = is_noisy ? (SEE_PRUNING_NOISY_MARGIN * depth) : (SEE_PRUNING_QUIET_MARGIN * depth);
+            if (!see_ge(pos, m, margin)) continue;
+        }
+
+        make_move(pos, m, &undo);
+        if (!in_check(pos, pos->side ^ 1)) {
+            legal++;
+            if (!is_noisy && num_quiets < 256) quiets[num_quiets++] = m;
+            pos_history[pos_history_count++] = pos->hash;
+
+            int gives_check = in_check(pos, pos->side);
+            PVLine child_pv = { 0 };
+            int score = 0;
+
+            /* Late Move Reductions (LMR) */
+            if (depth > 1 && legal > 1 && !(is_pv && is_noisy)) {
+                int d_idx = depth < 64 ? depth : 63, m_idx = legal < 64 ? legal : 63;
+                int R = lmr_table[d_idx][m_idx] - history[pos->side ^ 1][from][to][src_th][dst_th] / 2048;
+                if (!is_pv) R += 2;
+                if (is_killer) R -= 2;
+                if (gives_check) R--;
+                if (!is_noisy && src_th && !dst_th) R--; /* Escape Reduction */
+
+                if (R < 1) R = 1;
+                if (R > depth - 1) R = depth - 1;
+
+                score = -search(pos, depth - 1 - R, -alpha - 1, -alpha, ply + 1, &child_pv, 0);
+                if (score > alpha && R > 1)
+                    score = -search(pos, depth - 1, -alpha - 1, -alpha, ply + 1, &child_pv, 0);
+            } else if (!is_pv || legal > 1) {
+                score = -search(pos, depth - 1, -alpha - 1, -alpha, ply + 1, &child_pv, 0);
+            }
+
+            if (is_pv && (legal == 1 || (score > alpha && score < beta)))
+                score = -search(pos, depth - 1, -beta, -alpha, ply + 1, &child_pv, 0);
+
+            pos_history_count--;
+            undo_move(pos, m, &undo);
+
+            if (time_over_flag) return 0;
+            if (score > best_score) best_score = score;
+            if (score >= beta) {
+                if (!is_tactical(pos, m)) {
+                    if (ply < MAX_PLY && m != killers[0][ply]) {
+                        killers[1][ply] = killers[0][ply];
+                        killers[0][ply] = m;
+                    }
+                    int bonus = history_bonus(depth);
+                    update_history(pos->side, from, to, src_th, dst_th, bonus);
+                    for (int q = 0; q < num_quiets - 1; q++) {
+                        Move qm = quiets[q];
+                        int qf = move_from(qm), qt = move_to(qm);
+                        update_history(pos->side, qf, qt, (opp_threats & bit(qf)) != 0, (opp_threats & bit(qt)) != 0, -bonus);
+                    }
                 }
+                tt_store(pos->hash, depth, score, TT_BETA, m, ply);
+                return score;
             }
-            mob -= mob_center[pt];
-            add_score(mg, eg, color, mob_step_mg[pt] * mob, mob_step_eg[pt] * mob);
-        }
-    }
-
-    /* Bishop pair bonus using incremental count */
-    for (int c = 0; c < 2; c++)
-        if (count[c][BISHOP] >= 2) add_score(mg, eg, c, 29, 60);
-
-    /* King pawn shield -- MG only.
-           In the endgame, king centralisation is already rewarded by the
-           EG king PST; a pawn shield is irrelevant and would only hurt. */
-
-    static const int shield_val[8] = { 0, 27, 16, 4, -5, 12, 51, -21 };
-    for (int color = 0; color < 2; color++) {
-        int ksq = king_sq(color), kf = ksq & 7;
-        if (kf <= 2 || kf >= 5) {
-            int shield = 0;
-            for (int ft = kf - 1; ft <= kf + 1; ft++) if (ft >= 0 && ft <= 7) {
-                shield += shield_val[lowest_pawn_rank[color][ft]];
-                if (lowest_pawn_rank[color][ft] == 7) shield -= 5 * (lowest_pawn_rank[color ^ 1][ft] == 7);
-            }
-            mg[color] += shield;
-        }
-    }
-
-    /* Second pass: iterate pr_list (pawns and rooks only).
-       Pawns: doubled, isolated, passed pawn scoring.
-       Rooks: open/semi-open file bonus.                  */
-    static const int pp_mg[8] = { 0, 7, -6, -7, 8, 40, 106, 0 };
-    static const int pp_eg[8] = { 0, -14, 1, 34, 62, 98, 57, 0 };
-    static const int pp_blocked_mg[8] = { 0, -7, -20, -7, 14, 61, 117, 0 };
-    static const int pp_blocked_eg[8] = { 0, -4, 2, 9, 2, -7, -60, 0 };
-
-    for (i = 0; i < pr_index; i++) {
-        int sq = pr_list[i], p = piece_on(sq);
-        int pt = piece_type(p), color = piece_color(p), f = sq & 7;
-
-        if (pt == ROOK) {
-            if (lowest_pawn_rank[color][f] == 7) {
-                if (lowest_pawn_rank[color ^ 1][f] == 7)    add_score(mg, eg, color, 44, -3);
-                else    add_score(mg, eg, color, 21, 6);
+            if (score > alpha) {
+                alpha = score; bound = TT_EXACT; best_move = m;
+                if (pv) pvline_update(pv, m, &child_pv);
             }
             continue;
         }
-
-        /* PAWN: doubled, isolated, passed */
-        int rank = sq >> 4;
-        int own_rank = (color == WHITE) ? rank : (7 - rank);
-        int enemy = color ^ 1;
-
-        /* Doubled */
-        if (own_rank != lowest_pawn_rank[color][f])
-            add_score(mg, eg, color, -12, -20);
-
-        /* Passed and isolated detection */
-        int passed = 1, isolated = 1;
-        for (int df = -1; df <= 1; df++) {
-            int ef = f + df;
-            if (ef < 0 || ef > 7) continue;
-
-            /* Passed-pawn test: enemy pawn ahead on same/adjacent file */
-            if (lowest_pawn_rank[enemy][ef] != 7) {
-                int enemy_front_rank = 7 - lowest_pawn_rank[enemy][ef];
-                if (enemy_front_rank >= own_rank) passed = 0;
-            }
-            /* Isolated-pawn test: any friendly pawn on adjacent file cancels isolation */
-            if (df != 0 && lowest_pawn_rank[color][ef] != 7) isolated = 0;
-        }
-
-        if (isolated) add_score(mg, eg, color, -15, -12);
-        if (!passed) continue;
-
-        /* Passed pawn bonus -- separate tables for blocked/unblocked */
-        int front = sq + (color == WHITE ? 16 : -16);
-        int blocked = !sq_is_off(front) && !is_empty(front) && color_on(front) == enemy;
-        int bonus_mg = blocked ? pp_blocked_mg[own_rank] : pp_mg[own_rank];
-        int bonus_eg = blocked ? pp_blocked_eg[own_rank] : pp_eg[own_rank];
-        bonus_eg += 12 * (distance(sq, king_sq(enemy)) - distance(sq, king_sq(color)));
-        add_score(mg, eg, color, bonus_mg, bonus_eg);
+        undo_move(pos, m, &undo);
     }
 
-    /* Tapered blend.
-       phase clamps to [0,24]: values beyond 24 (e.g. at game start) are
-       treated as full middlegame.  The interpolation formula:
-           (mg_score * phase + eg_score * (24 - phase)) / 24
-       gives pure MG at phase=24 and pure EG at phase=0. */
-    if (phase > 24) phase = 24;
-    int mg_score = mg[side] - mg[side ^ 1];
-    int eg_score = eg[side] - eg[side ^ 1];
-    int score = (mg_score * phase + eg_score * (24 - phase)) / 24;
+    if (!legal) return in_chk ? -(MATE - ply) : 0;
+    tt_store(pos->hash, depth, best_score, bound, best_move, ply);
+    return best_score;
+}
 
-    /* DRAWISH ENDGAME SCALING -- disabled, retest at 2600+ Elo
-    int winner = (score > 0) ? side : (side ^ 1);
-    if (count[winner][PAWN] == 0
-        && count[winner][QUEEN] + count[winner][ROOK] < 2
-        && count[winner][KNIGHT] + count[winner][BISHOP] < 3) {
-        int bal = 3 * (count[winner][KNIGHT] + count[winner][BISHOP] - count[winner^1][KNIGHT] - count[winner^1][BISHOP])
-                + 5 * (count[winner][ROOK]   - count[winner^1][ROOK])
-                + 9 * (count[winner][QUEEN]  - count[winner^1][QUEEN]);
-        if (bal < 5) score /= 3;
-    } */
+static void print_move(Move m) {
+    if (!m) return;
+    int from = move_from(m), to = move_to(m), flag = move_flag(m);
+    printf("%c%c%c%c", (from % 8) + 'a', (from / 8) + '1', (to % 8) + 'a', (to / 8) + '1');
+    if (flag >= FLAG_PROMO_N) printf("%c", "nbrq"[flag - FLAG_PROMO_N]);
+}
+
+int search_root(Position *pos, int max_depth, int64_t hard_limit_ms, int64_t soft_limit_ms) {
+    tt_age++; search_start_time = clock();
+    search_hard_limit_ms = hard_limit_ms; search_soft_limit_ms = soft_limit_ms;
+    time_over_flag = nodes_searched = root_best_move = 0;
+    memset(killers, 0, sizeof(killers));
+    nnue_refresh(pos);
+
+    PVLine root_pv = { 0 };
+
+    /* Initialize fallback with first strictly legal move */
+    MoveList root_list;
+    generate_moves(pos, &root_list, 0);
+    UndoInfo root_undo;
+    for (int i = 0; i < root_list.count; i++) {
+        make_move(pos, root_list.moves[i], &root_undo);
+        int legal = !in_check(pos, pos->side ^ 1);
+        undo_move(pos, root_list.moves[i], &root_undo);
+        if (legal) { root_pv.moves[0] = root_list.moves[i]; root_pv.count = 1; break; }
+    }
+
+    int score = 0, prev_score = 0;
+
+    for (int depth = 1; depth <= max_depth; depth++) {
+        PVLine iter_pv = { 0 };
+
+        if (depth < 5) {
+            score = search(pos, depth, -INF, INF, 0, &iter_pv, 0);
+        } else {
+            int delta = 12, search_depth = depth;
+            int alpha = (prev_score - delta > -INF) ? (prev_score - delta) : -INF;
+            int beta  = (prev_score + delta <  INF) ? (prev_score + delta) :  INF;
+
+            while (1) {
+                if (alpha < -2000) alpha = -INF;
+                if (beta > 2000) beta = INF;
+
+                score = search(pos, search_depth, alpha, beta, 0, &iter_pv, 0);
+                if (time_over_flag) break;
+
+                if (score <= alpha) {
+                    beta = (alpha + beta) / 2;
+                    alpha = (alpha - delta > -INF) ? (alpha - delta) : -INF;
+                    search_depth = depth;
+                } else if (score >= beta) {
+                    beta = (beta + delta < INF) ? (beta + delta) : INF;
+                    if (search_depth > 1) search_depth--;
+                } else break;
+                delta += delta / 2;
+            }
+        }
+
+        if (time_over_flag && root_pv.count > 0) break;
+        prev_score = score;
+
+        if (iter_pv.count > 0) {
+            root_pv = iter_pv;
+            root_best_move = root_pv.moves[0];
+        }
+
+        clock_t elapsed = clock() - search_start_time;
+        int64_t ms = (int64_t)(elapsed * 1000 / CLOCKS_PER_SEC);
+        u64 nps = ms > 0 ? (nodes_searched * 1000 / ms) : 0;
+
+        printf("info depth %d ", depth);
+        print_score(score);
+        printf("nodes %llu time %lld nps %llu pv ", (unsigned long long)nodes_searched, (long long)ms, (unsigned long long)nps);
+        for (int i = 0; i < root_pv.count; i++) { print_move(root_pv.moves[i]); printf(" "); }
+        printf("\n");
+        fflush(stdout);
+
+        if (score > MATE - 512 || score < -MATE + 512) break;
+
+        if (search_soft_limit_ms > 0 && depth >= 4) {
+            int64_t current_soft = search_soft_limit_ms;
+            if (depth >= 6) {
+                int complexity = abs(score - nnue_evaluate(pos));
+                if (complexity > 200) complexity = 200;
+                current_soft = (int64_t)(current_soft * (0.8 + 0.4 * ((double)complexity / 200.0)));
+            }
+            if (ms >= current_soft) break;
+        }
+    }
+
+    printf("bestmove ");
+    if (root_pv.count > 0) print_move(root_pv.moves[0]);
+    printf("\n");
+    fflush(stdout);
     return score;
 }
 
-/* ===============================================================
-   S10  MOVE ORDERING
-   ===============================================================
+/* ================================================================
+   S8  UCI & BENCHMARKS
+   ================================================================
 
-   Idea
-   Alpha-Beta pruning performs optimally when the best move is examined
-   first. Perfect ordering theoretically reduces the search space from
-   O(b^d) to O(b^(d/2)), doubling search depth effectively at zero cost.
+   The Universal Chess Interface (UCI) is an open text protocol
+   spoken between chess engines and graphical user interfaces
+   (such as Arena, Cutechess, or Lichess bots) over standard
+   input and standard output.
 
-   Implementation
-   We score every generated move before searching, then pick the best
-   lazily (one selection-sort step per move searched).
-   1. Hash move      (30000):  TT best move from a prior search.
-   2. MVV-LVA        (20000+): 20000 + 10*cap_val - atk_val.
-   3. Promotion      (19999):  Queen underpromotion.
-   4. Killer slot 0  (19998):  Most recent quiet beta-cutoff at this ply.
-   5. Killer slot 1  (19997):  Older quiet beta-cutoff at this ply.
-   6. History   (-16000..16000): Bonus/malus from beta-cutoff tracking.
-      Negative scores are intentional: they push failing moves to the bottom
-      of the ordering without ever skipping them entirely.
+   The engine processes commands line by line:
+     uci        : Identify engine name and author, and report options.
+     isready    : Synchronization ping; engine replies "readyok".
+     ucinewgame : Prepare for a new game; clear hash and history tables.
+     position   : Set up the board from FEN or "startpos", then replay
+                  any subsequent move history.
+     go         : Begin searching under the specified clock or depth
+                  limits, then print "bestmove".
+     quit       : Terminate the program.
+
+   Time management calculates two boundaries from the clock parameters:
+     - Soft limit : The target search time, scaled by position
+                    volatility (eval vs search divergence). Iterative
+                    deepening stops cleanly after completing any depth
+                    iteration past this duration.
+     - Hard limit : The emergency ceiling. The search polls the clock
+                    every 2048 nodes and terminates immediately if this
+                    boundary is crossed mid-depth.
+
+   `perft` (Performance Test) counts all leaf paths to a specified depth
+   by recursive move generation without evaluation or pruning. Because
+   the exact count of positions at each depth is a mathematical
+   invariant, comparing results against reference values provides a
+   definitive test of move generation, check detection, and make/undo.
 */
 
-static inline int pawn_defended_by_pawn(int s) {
-    int p = piece_on(s); if (!p || piece_type(p) != PAWN) return 0;
-    int c = piece_color(p), a1 = s+(c==WHITE?-17:15), a2 = s+(c==WHITE?-15:17);
-    return (!sq_is_off(a1) && piece_is(a1,c,PAWN)) || (!sq_is_off(a2) && piece_is(a2,c,PAWN));
-}
-
-static inline int score_move(Move m, Move hash_move, int sply) {
-    int cap, sc = 0;
-    if (m == hash_move) return 30000;
-
-    int fr = move_from(m); int to = move_to(m);
-    cap = piece_on(move_to(m));
-
-    /* EP captures land on an empty square; treat them as pawn captures for ordering. */
-    if (!cap && ptype_on(move_from(m)) == PAWN && move_to(m) == ep_square)
-        cap = make_piece(xside, PAWN);
-
-    if (cap) {
-        int hunter_type = ptype_on(fr); int prey_type = piece_type(cap);
-
-        if (prey_type == PAWN && hunter_type != PAWN && pawn_defended_by_pawn(to))
-            sc = -17000 + 10 * piece_val[prey_type] - piece_val[hunter_type];
-        else
-            sc = 20000 + 10 * piece_val[prey_type] - piece_val[hunter_type];
-    }
-    else if (move_promo(m)) sc = 19999;
-    else if (sply < MAX_PLY && m == killers[sply][0]) sc = 19998;
-    else if (sply < MAX_PLY && m == killers[sply][1]) sc = 19997;
-    else                    sc = hist[fr][to];  /* [-16000, 16000] */
-    return sc;
-}
-
-/* Score all moves into a parallel array. Called once before the move loop. */
-static void score_moves(Move* moves, int* scores, int n, Move hash_move, int sply) {
-    for (int i = 0; i < n; i++) scores[i] = score_move(moves[i], hash_move, sply);
-}
-
-/* Partial sort: swap the best remaining move to position idx.
-   Called once per move inside the loop -- O(n) per pick vs O(n^2) total
-   for selection sort, but we only pay for moves we actually search.      */
-static void pick_move(Move* moves, int* scores, int n, int idx) {
-    int best = idx;
-    for (int i = idx + 1; i < n; i++)
-        if (scores[i] > scores[best]) best = i;
-    if (best != idx) {
-        int ts = scores[idx]; scores[idx] = scores[best]; scores[best] = ts;
-        Move tm = moves[idx];  moves[idx] = moves[best];  moves[best] = tm;
-    }
-}
-
-/* ===============================================================
-   S11  SEARCH
-   ===============================================================
-
-   Idea
-   The engine looks ahead by recursively exploring all replies to all
-   moves.  The tree grows exponentially with depth, so we prune
-   branches that cannot change the final result.
-
-   Implementation (Negamax Alpha-Beta)
-   Negamax reformulates minimax as a single recursive function: the
-   score for the current side is the negation of the best score the
-   opponent achieves.  Alpha-beta cuts branches where the opponent
-   already has a refutation.
-
-   Extra heuristics layered on top:
-   1. Quiescence Search (QS): at depth 0, keep searching captures
-      until the position is "quiet" to avoid the horizon effect.
-   2. Reverse Futility Pruning (RFP): at shallow depths, if the static
-      eval minus a margin already beats beta, skip the search entirely.
-      Zero nodes spent -- much cheaper than NMP.
-   3. Null Move Pruning (NMP): pass our turn; if the opponent still
-      can't beat beta at reduced depth, prune without searching.
-   4. Principal Variation Search + LMR: search the first legal move with
-      a full window. Every subsequent move is probed with a null window
-      (-alpha-1, -alpha); late quiet moves also get depth-2 (LMR probe).
-      A null-window beat that escapes the alpha bound triggers a full
-      re-search. This is the standard PVS/LMR architecture.
-   5. Transposition Table (TT): cache each sub-tree result by Zobrist
-      key so the same position via different move orders is only
-      searched once.
-   6. Aspiration Windows: start each iterative-deepening depth with a
-      narrow window around the previous score; widen on failure.
-   7. Repetition detection: 2-fold within the search tree returns draw
-      immediately; 2 prior occurrences in game history (3-fold total) also
-      returns draw. Bounded by halfmove_clock to skip irreversible positions.
-*/
-
-/* ---------------------------------------------------------------
-   print_move / print_pv  -- formatting helpers
-   ---------------------------------------------------------------
-   A chess move in UCI format: <from><to>[promo], e.g. "e2e4", "a7a8q".
-   print_pv prints the full principal variation for the info line.
-*/
-
-void print_move(Move m) {
-    static const char promo_ch[7] = { 0,0,'n','b','r','q',0 }; /* KNIGHT=2..QUEEN=5 */
-    int fr = move_from(m), to = move_to(m), pr = move_promo(m);
-    printf("%c%c%c%c", 'a' + (fr & 7), '1' + (fr >> 4), 'a' + (to & 7), '1' + (to >> 4));
-    if (pr && pr < 7) putchar(promo_ch[pr]);
-}
-
-static void print_pv(void) {
-    for (int k = 0; k < pv_length[0]; k++) { putchar(' '); print_move(pv[0][k]); }
-}
-
-void print_result(int best_sc) {
-    /* UCI info line: depth, score, nodes, time, pv
-   MATE SCORE FORMAT
-   -----------------
-   The UCI spec requires two distinct score tokens:
-     "score cp X"    -- normal centipawn score
-     "score mate N"  -- N moves to checkmate
-                       positive N: we deliver mate
-                       negative N: we are being mated
-   We detect a mate score by testing abs(score) > MATE - MAX_PLY.
-   The move-count formula:
-     mating:  N =  (MATE - score + 1) / 2
-     mated:   N = -(MATE + score + 1) / 2
-     */
-    int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
-    int64_t nps = ms ? 1000 * nodes_searched / (clock() - t_start) : 0;
-    if (best_sc > MATE - MAX_PLY) printf("info depth %d score mate %d nodes %" PRId64 " time %" PRId64 " nps %" PRId64 " pv", root_depth, (MATE - best_sc + 1) / 2, nodes_searched, ms, nps);
-    else if (best_sc < -(MATE - MAX_PLY)) printf("info depth %d score mate %d nodes %" PRId64 " time %" PRId64 " nps %" PRId64 " pv", root_depth, -(MATE + best_sc + 1) / 2, nodes_searched, ms, nps);
-    else    printf("info depth %d score cp %d nodes %" PRId64 " time %" PRId64 " nps %" PRId64 " pv", root_depth, best_sc, nodes_searched, ms, nps);
-    print_pv(); printf("\n"); fflush(stdout);
-}
-
-/* ---------------------------------------------------------------
-   qsearch  -- quiescence search (captures only)
-   ---------------------------------------------------------------
-   At depth 0 the horizon effect can cause tactical blindness: the
-   engine stops thinking just as a piece is hanging.  Quiescence
-   search extends the tree with captures until the position is
-   "quiet," eliminating this horizon distortion.
-
-   Stand-pat: the side to move can always decline further captures,
-   so we initialise best_sc = static eval.  If that already exceeds
-   beta we prune immediately (standing pat is good enough).
-
-   Delta pruning: if even capturing the most valuable piece on the
-   board plus a safety margin cannot raise alpha, skip the subtree
-   entirely -- no capture can possibly help.
-
-   SEE pruning replaces the old pawn-defended-pawn heuristic with a
-   full exchange evaluation: any capture where SEE < 0 is skipped.
---------------------------------------------------------------- */
-
-static inline int line_step(int from, int to) {
-    int diff = to - from;
-
-    if ((from & 7) == (to & 7))         return (diff > 0) ? 16 : -16;  /* same file */
-    if ((from >> 4) == (to >> 4))       return (diff > 0) ? 1 : -1;  /* same rank */
-    if (diff % 17 == 0)                 return (diff > 0) ? 17 : -17;  /* main diagonal */
-    if (diff % 15 == 0)                 return (diff > 0) ? 15 : -15;  /* anti-diagonal */
-
-    return 0; /* not aligned */
-}
-
-/* ---------------------------------------------------------------
-   piece_attacks_sq  --  does the piece on `from` attack `to`?
-   Squares in cleared[] are treated as empty for slider ray tracing,
-   which lets sliding pieces "see through" captured pieces (x-rays).
---------------------------------------------------------------- */
-static int piece_attacks_sq(int from, int to) {
-    int diff = to - from;
-    int pt  = ptype_on(from);
-    int col = color_on(from);
-
-    if (pt == PAWN) {
-        return diff == ((col == WHITE) ? 15 : -17)
-            || diff == ((col == WHITE) ? 17 : -15);
-    }
-
-    if (pt == KNIGHT) {
-        return diff == -33 || diff == -31 || diff == -18 || diff == -14 ||
-               diff == 14 || diff == 18 || diff == 31 || diff == 33;
-    }
-
-    if (pt == KING) {
-        return diff == -17 || diff == -16 || diff == -15 || diff == -1 ||
-               diff == 1 || diff == 15 || diff == 16 || diff == 17;
-    }
-
-    /* Sliders */
-    int step = line_step(from, to);
-    if (!step) return 0;
-
-    if (pt == BISHOP && step != -17 && step != -15 && step != 15 && step != 17) return 0;
-    if (pt == ROOK && step != -16 && step != -1 && step != 1 && step != 16) return 0;
-
-    for (int sq = from + step; !(sq & 0x88); sq += step) {
-        if (sq == to) return 1;
-        if (!is_empty(sq) && see_cleared[sq] != see_sentinel) break;
-    }
-
-    return 0;
-}
-
-/* ---------------------------------------------------------------
-   see  --  Static Exchange Evaluation
-   Simulates all captures on `to`, starting with the piece on `from`.
-   Returns net material gain (cp) for the side making the first capture.
-   Negative = losing exchange.  X-rays are handled naturally: when a
-   piece is marked cleared[], sliders behind it join the exchange.
---------------------------------------------------------------- */
-static int see(int from, int to) {
-   
-    if (see_sentinel >= 16384) {
-        see_sentinel = 1;
-        memset(see_cleared, 0, sizeof(see_cleared));
-    }
-    else see_sentinel++;
-
-    int cap_type = ptype_on(to);
-    if (!cap_type) return 0;   /* en passant: captured pawn not on `to`, treat as even */
-
-    see_cleared[from] = see_sentinel;
-
-    /* target_seq[d] = type of piece sitting on `to` that gets captured at step d.
-       Step 0 = initial capture; step d+1 = recapture of what step d placed. */
-    int target_seq[32];
-    int nsteps = 0;
-    target_seq[0] = cap_type;
-
-    int piece_on_to = ptype_on(from); /* attacker now sits on `to` */
-    int cur_side    = color_on(from) ^ 1;
-
-    while (nsteps < 31) {
-        /* Find least-valuable attacker of `to` for cur_side, skipping cleared squares */
-        int lva_sq = -1, lva_type = 0, lva_val = INF;
-        int base = (cur_side == WHITE) ? 0 : 16;
-        int top  = base + list_count[cur_side];
-        for (int i = base; i < top; i++) {
-            int psq = list_square[i];
-            if (psq == LIST_OFF) continue; /* captured in game */
-            if (see_cleared[psq] == see_sentinel) continue;    /* already used in this exchange */
-            int pv = piece_val[list_piece[i]];
-            if (pv < lva_val && piece_attacks_sq(psq, to)) {
-                lva_val  = pv;
-                lva_sq   = psq;
-                lva_type = list_piece[i];
-            }
+void parse_fen(Position *pos, const char *fen) {
+    memset(pos, 0, sizeof(Position));
+    for (int i = 0; i < 64; i++) pos->mailbox[i] = NO_PIECE;
+    int r = 7, f = 0;
+    while (*fen && *fen != ' ') {
+        if (*fen == '/') { r--; f = 0; }
+        else if (isdigit(*fen)) f += *fen - '0';
+        else {
+            int s = isupper(*fen) ? WHITE : BLACK, c = tolower(*fen);
+            set_piece(pos, s, (c=='p')?PAWN:(c=='n')?KNIGHT:(c=='b')?BISHOP:(c=='r')?ROOK:(c=='q')?QUEEN:KING, r * 8 + f++);
         }
-        if (lva_sq < 0) break;
-
-        target_seq[nsteps + 1] = piece_on_to;
-        see_cleared[lva_sq] = see_sentinel;
-        piece_on_to = lva_type;
-        cur_side ^= 1;
-        nsteps++;
+        fen++;
     }
-
-    /* Walk back: each player can stop (gain 0) rather than continue losing.
-       result = opponent's maximum gain from step d onward. */
-    int result = 0;
-    for (int d = nsteps - 1; d >= 0; d--) {
-        int gain = piece_val[target_seq[d + 1]] - result;
-        result = gain > 0 ? gain : 0;
+    if (*fen) fen++;
+    pos->side = (*fen == 'b') ? BLACK : WHITE;
+    if (*fen) fen++;
+    if (*fen) fen++;
+    pos->castling = 0;
+    while (*fen && *fen != ' ') {
+        if (*fen == 'K') pos->castling |= CASTLE_WK;
+        if (*fen == 'Q') pos->castling |= CASTLE_WQ;
+        if (*fen == 'k') pos->castling |= CASTLE_BK;
+        if (*fen == 'q') pos->castling |= CASTLE_BQ;
+        fen++;
     }
-    return piece_val[cap_type] - result;
+    pos->ep = SQ_NONE;
+    if (*fen) fen++;
+    if (*fen != '-' && *fen >= 'a' && *fen <= 'h') pos->ep = (fen[1] - '1') * 8 + (fen[0] - 'a');
+    pos->hash = generate_hash(pos);
+    if (nnue.loaded) nnue_refresh(pos);
 }
 
-/* Returns 1 if the capture from->to is obviously or probably losing.
-   Fast path: attacker <= victim means SEE >= 0, so skip the full exchange. */
-static inline int is_bad_capture(int from, int to) {
-    if (piece_val[ptype_on(from)] <= piece_val[ptype_on(to)]) return 0;
-    return see(from, to) < 0;
-}
-
-static int qsearch(int alpha, int beta, int sply) {
-    Move moves[256]; int best_sc, sc;
-
-    pv_length[sply] = sply;
-
-    /* Time check -- same cadence as main search */
-    if ((nodes_searched & 1023) == 0 && time_budget_ms > 0) {
-        int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
-        if (ms >= time_budget_ms) { time_over_flag = 1; return 0; }
-    }
-    if (time_over_flag) return 0;
-
-    /* Stand-pat: static eval as lower bound (we can always stop capturing) */
-    best_sc = evaluate();
-    if (best_sc >= beta) return best_sc;
-    if (best_sc > alpha) alpha = best_sc;
-
-    nodes_searched++;
-
-    int cnt = generate_captures(moves);
-    int scores[256];
-    score_moves(moves, scores, cnt, 0, sply);
-
-    for (int i = 0; i < cnt; i++) {
-        pick_move(moves, scores, cnt, i);
-
-        /* DELTA PRUNING: skip if even the captured piece + margin cannot raise alpha */
-        int dp_cap = piece_on(move_to(moves[i]));
-        int dp_ep  = (!dp_cap && ptype_on(move_from(moves[i])) == PAWN
-                      && move_to(moves[i]) == ep_square);
-        if (dp_cap || dp_ep) {
-            int cap_val = dp_cap ? piece_val[piece_type(dp_cap)] : piece_val[PAWN];
-            if (best_sc + cap_val + 200 < alpha) continue;
-        }
-
-        /* QS SEE PRUNING: skip captures that lose material in the full exchange.
-           Promotions are always searched (large material swing).
-           En passant returns SEE == 0 (ptype_on(to) == 0) so is kept. */
-        if (!move_promo(moves[i]) && is_bad_capture(move_from(moves[i]), move_to(moves[i])))
-            continue;
-
-        make_move(moves[i]);
-        if (is_illegal()) { undo_move(); continue; }
-
-        sc = -qsearch(-beta, -alpha, sply + 1);
-        undo_move();
-
-        if (sc > best_sc) best_sc = sc;
-        if (sc > alpha) {
-            alpha = sc;
-            if (!time_over_flag && moves[i] != 0) {
-                pv[sply][sply] = moves[i];
-                for (int k_ = sply + 1; k_ < pv_length[sply + 1]; k_++) pv[sply][k_] = pv[sply + 1][k_];
-                pv_length[sply] = pv_length[sply + 1];
-            }
-        }
-        if (alpha >= beta) break;
-    }
-    return best_sc;
-}
-
-/* ---------------------------------------------------------------
-   search  -- negamax alpha-beta with TT, PVS, and killers
-   ---------------------------------------------------------------
-   Negamax: the score for the side to move equals the negation of
-   the best score the opponent achieves.  One recursive function
-   replaces the classical minimax pair.
-
-   Alpha-beta: maintain a window [alpha, beta].  Alpha = best score
-   the maximising side is guaranteed; beta = best the minimising
-   side is guaranteed.  Any subtree that cannot improve on these
-   bounds is pruned immediately.
-
-   Principal Variation Search (PVS): the first legal move is
-   searched with the full [alpha, beta] window.  Every subsequent
-   move is probed with a null window (-alpha-1, -alpha) -- if our
-   current best is truly best they fail low cheaply.  A null-window
-   score that beats alpha triggers a full re-search on PV nodes.
-
-   Check extension: if the move gives check, extend by 1 ply so the
-   engine never horizon-drops while the opponent is in check.
---------------------------------------------------------------- */
-int search(int depth, int alpha, int beta, int sply, int was_null) {
-    Move moves[256], best = 0, hash_move = 0;
-    int legal = 0, best_sc, old_alpha = alpha, sc;
-    int is_pv = (beta - alpha > 1); /* PV node: wide window, not a null-window probe */
-    TTEntry* e = &tt[hash_key % (HASH)tt_size];
-
-    /* Clear PV at this ply before any early returns (TT hits, repetition).
-       The parent reads pv_length[sply] to splice in the child continuation;
-       it must equal sply (empty) rather than a stale value. */
-    pv_length[sply] = sply;
-
-    /* HARD TIME LIMIT CHECK
-       Every 1024 nodes, check if we have exceeded our absolute time budget.
-       If we have, abort the search tree immediately to prevent flagging. */
-    if ((nodes_searched & 1023) == 0 && time_budget_ms > 0) {
-        int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
-        if (ms >= time_budget_ms) { time_over_flag = 1; return 0; }
-    }
-    if (time_over_flag) return 0;
-
-    /* Drop into quiescence search at the horizon */
-    if (depth <= 0) return qsearch(alpha, beta, sply);
-
-    /* REPETITION DETECTION
-       Two rules apply, depending on whether the repeated position is inside
-       the current search tree or in the game history before the search root.
-
-       In-tree (ply >= root_ply): we are actively creating the repetition.
-       One prior occurrence is enough to return draw -- the opponent can
-       always force the third occurrence on the real board.
-
-       In-history (ply < root_ply): the position was reached before the
-       search started. That is only one prior occurrence; strict threefold
-       requires two prior occurrences (three total) to be a forced draw.
-
-       The halfmove_clock bound is exact: no repetition can cross an
-       irreversible move (pawn advance or capture), so we need not look
-       further back than ply - halfmove_clock. We step by 2 because
-       repetitions require the same side to move. */
-    if (ply > root_ply) {
-        /* Repetition detection */
-        for (int i = ply - 2; i >= root_ply; i -= 2)
-            if (history[i].hash_prev == hash_key) return 0;
-        int reps = 0;
-        for (int i = ply - 2; i >= 0 && i >= ply - halfmove_clock; i -= 2)
-            if (history[i].hash_prev == hash_key && ++reps >= 2) return 0;
-
-        /* 50-move rule */
-        if (halfmove_clock >= 100) return 0;
-
-        /* INSUFFICIENT MATERIAL
-           Only trigger when there is exactly one minor piece on the board total
-           (KNK or KBK). With one minor per side the corner-checkmate edge case
-           means we cannot safely claim a draw. */
-        {
-            int wm = count[WHITE][KNIGHT]+count[WHITE][BISHOP], bm = count[BLACK][KNIGHT]+count[BLACK][BISHOP];
-            if (wm+bm==1 && !count[WHITE][PAWN] && !count[BLACK][PAWN]
-                && !count[WHITE][ROOK] && !count[BLACK][ROOK] && !count[WHITE][QUEEN] && !count[BLACK][QUEEN])
-                return 0;
-        }
-    }
-
-    /* TT probe: always extract hash_move for ordering */
-    if (e->key == hash_key) {
-        hash_move = e->best_move;
-        if ((int)tt_depth(e) >= depth) {
-            int flag = tt_flag(e);
-            /* Mate scores are stored relative to the node that proved them
-               (+sply on write) so the same position compares correctly when
-               retrieved via a transposition at a different search depth.
-               Reverse that shift before using the score here.            */
-            int tt_sc = e->score;
-            if (tt_sc > MATE - MAX_PLY) tt_sc -= sply;
-            if (tt_sc < -(MATE - MAX_PLY)) tt_sc += sply;
-            if (sply > 0) {
-                if (flag == TT_EXACT)                            return tt_sc;
-                if (!is_pv && flag == TT_BETA && tt_sc >= beta) return tt_sc;
-                if (!is_pv && flag == TT_ALPHA && tt_sc <= alpha) return tt_sc;
-            }
-        }
-    }
-
-    best_sc = -INF;
-    nodes_searched++;
-
-    /* Cache whether the side to move is currently in check.
-       RFP, NMP, and IIR all guard on this -- compute once, reuse three times. */
-    int node_in_check = (sply > 0) ? history[ply - 1].in_check : in_check(side);
-
-    /* REVERSE FUTILITY PRUNING (RFP)
-       If static eval is already well above beta at shallow depth, the
-       position is unlikely to become worse after a quiet move -- prune
-       immediately. Zero nodes spent per pruned node.
-       Guards: not at root (sply>0), not in check, not a mate score. */
-    /* Compute static eval once; shared by RFP, razoring, and NMP guard below.
-       Skipped entirely when in check (no pruning applies). */
-    int static_eval = (!is_pv && sply > 0 && !node_in_check && beta < MATE - MAX_PLY && depth <= 7)
-                      ? evaluate() : -INF;
-
-    if (static_eval != -INF) {
-        /* REVERSE FUTILITY PRUNING (RFP) */
-        if (depth <= 7 && static_eval - 70 * depth >= beta)
-            return static_eval - 70 * depth;
-        /* RAZORING: if eval is far below alpha even after the best capture,
-           there is no point searching -- drop straight into qsearch. */
-        if (depth <= 3 && static_eval + 300 + 60 * depth < alpha)
-            return qsearch(alpha, beta, sply);
-    }
-
-    /* NULL MOVE PRUNING (NMP)
-       Guard: static_eval >= beta ensures we're not in a losing position --
-       passing the turn when already losing is pointless and wastes a search.
-       R=3 normally, R=4 at depth >= 7.
-       Guards: not a PV node, no consecutive null moves (was_null),
-       not in check, and the side to move has non-pawn material
-       (zugzwang guard -- in pure pawn endings passing is often worst). */
-    if (!is_pv && sply > 0 && depth >= 3 && !was_null
-        && !node_in_check && beta < MATE - MAX_PLY
-        && (count[side][KNIGHT] + count[side][BISHOP]
-            + count[side][ROOK]  + count[side][QUEEN] > 0)) {
-
-        if (static_eval == -INF) static_eval = evaluate();
-
-        if (static_eval >= beta + 30) {
-            int R = 3 + depth / 4 + min(3, (static_eval - beta) / 200);
-            int ep_prev = ep_square;
-            hash_key ^= zobrist_side;
-            if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
-            ep_square = SQ_NONE;
-            side ^= 1; xside ^= 1;
-            history[ply].hash_prev = hash_key; ply++; /* push null move so repetition detection sees it */
-            int null_sc = -search(depth - R - 1, -beta, -beta + 1, sply + 1, 1);
-            ply--; side ^= 1; xside ^= 1;
-            ep_square = ep_prev;
-            if (ep_square != SQ_NONE) hash_key ^= zobrist_ep[ep_square];
-            hash_key ^= zobrist_side;
-            if (null_sc >= beta) return null_sc;
-        }
-    }
-
-    /* INTERNAL ITERATIVE REDUCTIONS (IIR)
-       If no hash move is available, the move ordering at this node is poor.
-       Reduce depth by 1 to avoid spending too much time on a badly-ordered
-       node; the resulting TT entry will guide a future full-depth search.
-       Guards: depth >= 4 so we don't reduce already-shallow nodes;
-       not in check -- evasions must be searched at full depth. */
-    if (depth >= 4 && !hash_move && !node_in_check) depth--;
-
-    int cnt = generate_moves(moves, 0);
-    int scores[256];
-    score_moves(moves, scores, cnt, hash_move, sply);
-    /* quiet_moves tracks searched quiet moves in order so the history malus
-       loop can penalise them without re-examining board[] after undo_move. */
-    Move quiet_moves[256]; int nquiet = 0, quiet = 0;
-
-    for (int i = 0; i < cnt; i++) {
-        pick_move(moves, scores, cnt, i);
-
-        /* Capture flag read before make_move: after the call board[to] holds
-           a piece regardless, making a post-move test useless.
-           En-passant has an empty destination, so check ep_square too. */
-        int is_cap = !is_empty(move_to(moves[i]))
-                  || (ptype_on(move_from(moves[i])) == PAWN
-                      && move_to(moves[i]) == ep_square);
-
-        /* PVS SEE PRUNING (captures)
-           Skip captures whose full exchange value is below a depth-scaled
-           threshold. Only applied once at least one legal move has been
-           searched (legal > 0) so we never prune the first move.
-           No make_move needed → no undo cost. */
-        if (!is_pv && !node_in_check && is_cap && !move_promo(moves[i])
-            && legal > 0
-            && piece_val[ptype_on(move_from(moves[i]))] > piece_val[ptype_on(move_to(moves[i]))]
-            && see(move_from(moves[i]), move_to(moves[i])) < -piece_val[PAWN] * depth)
-            continue;
-
-        make_move(moves[i]);
-        if (is_illegal()) { undo_move(); continue; }
-        legal++;
-        if (!is_cap && !move_promo(moves[i])) quiet++;
-
-        /* Cache whether this move gives check (opponent in check after make_move).
-           Used by both LMP and check extension -- compute once, reuse twice. */
-        int gives_check = history[ply - 1].in_check;
-
-        /* LATE MOVE PRUNING (LMP)
-           At shallow depths on non-PV nodes, skip quiet moves beyond the first few.
-           Threshold: depth 1 allows 5, depth 2 allows 9, depth 3 allows 13.
-           Moves that give check are exempted: they may be the only defence.
-           Also skip entirely when the mover was in check (evasions must be fully searched). */
-        if (!is_pv && depth < 4 && !node_in_check && quiet > 4 * depth + 1
-            && !is_cap && !move_promo(moves[i])) {
-            if (!gives_check) { undo_move(); continue; }
-        }
-
-        /* Push to quiet list only after LMP so pruned moves don't get malus */
-        if (!is_cap && !move_promo(moves[i])) quiet_moves[nquiet++] = moves[i];
-        /* CHECK EXTENSION: if the move gives check, extend by 1 ply.
-           This ensures the engine never horizon-drops into QS while
-           the opponent is in check -- the resolution is searched fully. */
-        int ext = gives_check ? 1 : 0;
-
-        /* PRINCIPAL VARIATION SEARCH + LMR
-           First legal move: full window to establish the PV.
-           All others: null window first; late quiet moves also get
-           a depth reduction from lmr_table. Re-search at full depth
-           if the reduced score beats alpha. */
-        if (legal == 1) {
-            sc = -search(depth - 1 + ext, -beta, -alpha, sply + 1, 0);
-        } else {
-            int lmr = 0;
-            /* Apply LMR only at depth >= 3 (enough remaining depth to be meaningful)
-               and after the 4th move (legal > 4) -- early moves are more likely
-               to be strong so we search them fully before reducing later ones.
-               Captures, promotions, and check-giving moves always get full depth. */
-            if (depth >= 3 && legal > 4 && !is_cap && !move_promo(moves[i]) && !ext) {
-                lmr = lmr_table[min(depth,31)][min(legal,63)];
-                if (lmr > depth - 2) lmr = depth - 2; /* always leave at least 1 ply */
-                if (lmr < 0) lmr = 0;
-            }
-            /* Three-level search:
-               1. Reduced null window (LMR probe): fast refutation check.
-               2. Full-depth null window: if reduced score beat alpha, get an exact
-                  bound at the proper depth (cheap if move is truly bad).
-               3. Full window on PV nodes only: if the score still exceeds alpha
-                  here, this move is a new PV candidate and needs an exact score. */
-            sc = -search(depth - 1 + ext - lmr, -alpha - 1, -alpha, sply + 1, 0);
-            if (sc > alpha && lmr > 0)
-                sc = -search(depth - 1 + ext, -alpha - 1, -alpha, sply + 1, 0);
-            if (sc > alpha && is_pv)
-                sc = -search(depth - 1 + ext, -beta, -alpha, sply + 1, 0);
-        }
-
-        undo_move();
-
-        if (sc > best_sc) best_sc = sc;
-        if (sc > alpha) {
-            alpha = sc;
-            best = moves[i];
-            /* Triangular PV update: store this move, then copy the child
-               ply's continuation into the current row of the table. */
-            if (!time_over_flag && moves[i] != 0) {
-                pv[sply][sply] = moves[i];
-                for (int k_ = sply + 1; k_ < pv_length[sply + 1]; k_++) pv[sply][k_] = pv[sply + 1][k_];
-                pv_length[sply] = pv_length[sply + 1];
-                if (sply == 0) { best_root_move = moves[i]; print_result(best_sc); }
-            }
-        }
-        if (alpha >= beta) {
-            if (!is_cap && !move_promo(moves[i])) {
-                int d = (sply < MAX_PLY) ? sply : MAX_PLY - 1;
-                killers[d][1] = killers[d][0]; killers[d][0] = moves[i];
-                /* History BONUS for the cutoff move, MALUS for quiets tried before it.
-                   Gravity formula: self-corrects instead of saturating at ±16000. */
-                int bonus = depth * depth;
-                int h = hist[move_from(moves[i])][move_to(moves[i])];
-                h += bonus - h * bonus / 16000;
-                hist[move_from(moves[i])][move_to(moves[i])] = h > 16000 ? 16000 : h;
-                for (int j = 0; j < nquiet - 1; j++) {
-                    int hm = hist[move_from(quiet_moves[j])][move_to(quiet_moves[j])];
-                    hm -= bonus + hm * bonus / 16000;
-                    hist[move_from(quiet_moves[j])][move_to(quiet_moves[j])] = hm < -16000 ? -16000 : hm;
-                }
-            }
-            break;
-        }
-    }
-
-    /* Checkmate or stalemate: no legal moves found after full generation.
-       MATE - sply encodes distance-to-mate so shorter mates score higher.
-       Stalemate returns 0 (draw). */
-    if (!legal) return node_in_check ? -(MATE - sply) : 0;
-
-    /* TT store: skip if search was aborted mid-tree (score is meaningless) */
-    if (!time_over_flag && (e->key != hash_key || depth >= (int)tt_depth(e))) {
-        int flag = (best_sc <= old_alpha) ? TT_ALPHA :
-            (best_sc >= beta) ? TT_BETA : TT_EXACT;
-        /* Encode mate scores as distance-from-node (+sply) so the score
-           stays valid when the position is retrieved via a transposition. */
-        int sc_store = best_sc;
-        if (sc_store > MATE - MAX_PLY) sc_store += sply;
-        if (sc_store < -(MATE - MAX_PLY)) sc_store -= sply;
-        /* For fail-low nodes, preserve the hash move from the probe for
-           ordering on the next visit even if no move raised alpha. */
-        Move store_move = best ? best : hash_move;
-        e->key = hash_key; e->score = sc_store; e->best_move = store_move;
-        e->depth_flag = tt_pack(depth > 0 ? depth : 0, flag);
-    }
-    return best_sc;
-}
-
-/* ---------------------------------------------------------------
-   search_root  -- iterative deepening with UCI info output
-   ---------------------------------------------------------------
-
-   We search depth 1, then 2, ... up to max_depth. After each
-   depth completes we emit a UCI info line:
-
-       info depth N score cp X nodes N time N pv e2e4 e7e5 ...
-
-   This lets the GUI display the engine's thinking in real time.
-   The best move from depth D guides ordering for depth D+1 via the
-   TT, making iterative deepening almost free compared to jumping
-   straight to depth N.
-
-   The root best move is placed at the front of the move list before
-   each iteration so it is tried first (TT also achieves this, but
-   explicit placement is a cheap belt-and-suspenders guarantee).
-*/
-
-void search_root(int max_depth) {
-    int sc = 0, prev_sc = 0;
-    time_over_flag = 0; best_root_move = 0; t_start = clock();
-    memset(hist, 0, sizeof(hist)); memset(killers, 0, sizeof(killers));
-    memset(pv, 0, sizeof(pv)); memset(pv_length, 0, sizeof(pv_length));
-    nodes_searched = 0;
-    root_ply = ply;   /* anchor sply=0 at the search root */
-
-    for (root_depth = 1; root_depth <= max_depth; root_depth++) {
-        if (root_depth < 5) {
-            /* Full window for early depths: score too volatile for a narrow window. */
-            sc = search(root_depth, -INF, INF, 0, 0);
-        } else {
-            /* ASPIRATION WINDOWS
-               Initial delta scales with score magnitude: unbalanced positions
-               (large |prev_sc|) are more volatile so they get a wider window.
-               On fail-low: collapse beta to the midpoint before widening alpha,
-               avoiding a needlessly large window on the high side.
-               On fail-high: widen beta only.
-               Proportional widening (delta += delta/2) is smoother than doubling. */
-            int delta = 15 + prev_sc * prev_sc / 16384;
-            int alpha = max(prev_sc - delta, -INF);
-            int beta  = min(prev_sc + delta,  INF);
-            while (1) {
-                sc = search(root_depth, alpha, beta, 0, 0);
-                if (time_over_flag) break;
-                if (sc <= alpha) {
-                    beta  = (alpha + beta) / 2; /* midpoint collapse */
-                    alpha = max(alpha - delta, -INF);
-                } else if (sc >= beta) {
-                    beta = min(beta + delta, INF);
-                } else {
-                    break;                      /* exact score within window */
-                }
-                delta += delta / 2;             /* proportional widening */
-            }
-        }
-        if (time_over_flag) break;
-        prev_sc = sc;
-
-        /* TIME CONTROL: stop iterating if we have used our budget.
-           We check AFTER a depth completes, never mid-search, so
-           the move we return is always from a fully searched depth. */
-        {
-            int64_t ms = (int64_t)(((int64_t)(clock() - t_start) * 1000) / CLOCKS_PER_SEC);
-            if (time_budget_ms > 0 && ms >= time_budget_ms / 2) break;
-        }
-    }
-    (void)sc;
-
-    printf("bestmove ");
-    if (best_root_move) print_move(best_root_move);
-    else printf("0000");
-    printf("\n");
-    fflush(stdout);
-}
-
-/* ===============================================================
-   S12  PERFT
-   ===============================================================
-
-   Idea
-   Perft counts the exact number of leaf nodes reachable at a given
-   depth from a given position.
-
-   Implementation
-   The counts are compared against published reference values.  Any
-   discrepancy immediately pinpoints a bug in move generation or
-   make/undo -- no evaluation or search heuristics are involved, so
-   the numbers are fully deterministic.
-*/
-
-int64_t perft(int depth) {
-    if (!depth) return 1;
-    Move moves[256];
-    int cnt = generate_moves(moves, 0);
-    int64_t n = 0;
-    for (int i = 0; i < cnt; i++) {
-        make_move(moves[i]);
-        if (!is_illegal()) n += perft(depth - 1);
-        undo_move();
-    }
-    return n;
-}
-
-/* ===============================================================
-   S13  UCI LOOP
-   ===============================================================
-
-   Idea
-   UCI (Universal Chess Interface) is the standard text protocol
-   between an engine and a GUI.  The engine reads commands from stdin
-   and writes responses to stdout; the GUI drives the session.
-
-   Implementation
-   A simple readline loop dispatches on the first token of each
-   command.  "position" sets up the board; "go" runs the search and
-   streams info lines during it; "bestmove" closes the response.
-   All output is flushed immediately so the GUI never blocks.
-*/
-
-static int parse_move(const char* s, Move* out) {
-    int fr, to, pr = 0; Move list[256]; int cnt, i;
+static Move parse_move(const Position *pos, const char *s) {
     if (!s || strlen(s) < 4) return 0;
-    fr = (s[0] - 'a') + (s[1] - '1') * 16;
-    to = (s[2] - 'a') + (s[3] - '1') * 16;
-    if (strlen(s) > 4) pr = char_to_piece((char)tolower(s[4]));
-    cnt = generate_moves(list, 0);
-    for (i = 0; i < cnt; i++)
-        if (move_from(list[i]) == fr && move_to(list[i]) == to && move_promo(list[i]) == pr) { *out = list[i]; return 1; }
+    int fr = (s[0] - 'a') + (s[1] - '1') * 8, to = (s[2] - 'a') + (s[3] - '1') * 8;
+    int pfl = (strlen(s) >= 5) ? ((tolower(s[4]) == 'n') ? FLAG_PROMO_N : (tolower(s[4]) == 'b') ? FLAG_PROMO_B : (tolower(s[4]) == 'r') ? FLAG_PROMO_R : FLAG_PROMO_Q) : 0;
+    MoveList list; generate_moves(pos, &list, 0);
+    for (int i = 0; i < list.count; i++) {
+        Move m = list.moves[i];
+        if (move_from(m) == fr && move_to(m) == to && (pfl ? (move_flag(m) == pfl) : (move_flag(m) < FLAG_PROMO_N))) return m;
+    }
     return 0;
 }
 
-/* Helpers for uci_loop */
-static const char STARTPOS[] = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-
-/* getval: find `key` in `line`, skip one space, then scan into `out` with `fmt`.
-   Uses strlen so it works on any runtime string, not just string literals.
-   e.g. getval(line, "depth", "%d", &depth) on "go depth 6" -> depth=6. */
-static void getval(const char* line, const char* key, const char* fmt, void* out) {
-    const char* t = strstr(line, key);
-    if (t) sscanf(t + strlen(key) + 1, fmt, out);
+static void parse_position(Position *pos, char *line) {
+    line += 8; while (*line == ' ') line++;
+    if (!strncmp(line, "startpos", 8)) { parse_fen(pos, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"); line += 8; }
+    else if (!strncmp(line, "fen", 3)) { line += 3; while (*line == ' ') line++; parse_fen(pos, line); }
+    char *mstr = strstr(line, "moves");
+    pos_history[0] = pos->hash; pos_history_count = 1;
+    if (mstr) for (char *tok = strtok(mstr + 5, " \t\r\n"); tok; tok = strtok(NULL, " \t\r\n")) {
+        Move m = parse_move(pos, tok);
+        if (m) { UndoInfo u; make_move(pos, m, &u); pos_history[pos_history_count++] = pos->hash; }
+    }
 }
 
-void uci_loop(void) {
-    char line[65536], * p;
-    Move m;
-
-    tt = calloc((size_t)tt_size, sizeof(TTEntry));
-    if (!tt) {
-        fprintf(stderr, "Error: failed to allocate TT (%lld entries)\n",
-            (long long)tt_size); exit(1);
+static void parse_go(Position *pos, char *line) {
+    int64_t wtime = 0, btime = 0, winc = 0, binc = 0, movetime = 0, hard_limit = 0, soft_limit = 0;
+    int movestogo = 0, depth = 64; char *p;
+    if ((p = strstr(line, "wtime"))) wtime = atoll(p + 6);
+    if ((p = strstr(line, "btime"))) btime = atoll(p + 6);
+    if ((p = strstr(line, "winc")))  winc  = atoll(p + 5);
+    if ((p = strstr(line, "binc")))  binc  = atoll(p + 5);
+    if ((p = strstr(line, "movestogo"))) movestogo = atoi(p + 10);
+    if ((p = strstr(line, "movetime")))  movetime = atoll(p + 9);
+    if ((p = strstr(line, "depth")))     depth = atoi(p + 6);
+    if (movetime > 0) hard_limit = soft_limit = movetime;
+    else if ((pos->side == WHITE && wtime > 0) || (pos->side == BLACK && btime > 0)) {
+        int64_t my_time = (pos->side == WHITE) ? wtime : btime, my_inc = (pos->side == WHITE) ? winc : binc;
+        int64_t base = (movestogo > 0 ? my_time / (movestogo + 1) : my_time / 20) + my_inc * 3 / 4;
+        hard_limit = base * 25 / 10;
+        if (hard_limit > my_time - 30) hard_limit = my_time - 30;
+        if (hard_limit < 10) hard_limit = 10;
+        soft_limit = base * 6 / 10;
+        if (soft_limit > hard_limit) soft_limit = hard_limit;
+        if (soft_limit < 5) soft_limit = 5;
     }
+    search_root(pos, depth, hard_limit, soft_limit);
+}
 
+u64 perft(Position *pos, int depth) {
+    if (depth <= 0) return 1;
+    MoveList list; generate_moves(pos, &list, 0);
+    u64 nodes = 0; UndoInfo undo;
+    for (int i = 0; i < list.count; i++) {
+        make_move(pos, list.moves[i], &undo);
+        if (!in_check(pos, pos->side ^ 1)) nodes += perft(pos, depth - 1);
+        undo_move(pos, list.moves[i], &undo);
+    }
+    return nodes;
+}
+
+void run_bench(void) {
+    static const struct { const char *f; int d; u64 n; } p[6] = {
+        {"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 5, 4865609},
+        {"r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 4, 4085603},
+        {"8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 5, 674624},
+        {"r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", 4, 422333},
+        {"rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 4, 2103487},
+        {"r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 4, 3894594}
+    };
+    const char *s[6] = { p[0].f, "r1bqkb1r/pppp1ppp/2n5/4p3/2B1n3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 5", "r2q1rk1/ppp2ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPP2PPP/R2Q1RK1 w - - 0 8", "r1b1k2r/ppppqppp/2n5/8/1bPP4/2N5/PP2BPPP/R1BQK2R w KQkq - 0 9", p[2].f, p[1].f };
+    Position pos; u64 tot = 0; clock_t st = clock();
+    printf("Running Perft Test Suite...\n");
+    for (int i = 0; i < 6; i++) {
+        parse_fen(&pos, p[i].f); u64 n = perft(&pos, p[i].d); tot += n;
+        printf("Pos %d (depth %d): %llu nodes %s\n", i + 1, p[i].d, (unsigned long long)n, n == p[i].n ? "[PASS]" : "[FAIL]");
+    }
+    double el = (double)(clock() - st) / CLOCKS_PER_SEC;
+    printf("Total Nodes: %llu, Time: %.3fs, NPS: %.2f MNPS\n\nSearch Benchmark (Pure Negamax Depth 4):\n", (unsigned long long)tot, el, tot / el / 1e6);
+    for (int i = 0; i < 6; i++) {
+        parse_fen(&pos, s[i]); tt_clear();
+        printf("Position %d:\n", i + 1); search_root(&pos, 4, 0, 0); printf("\n");
+    }
+}
+
+void uci_loop(int argc, char **argv) {
+    Position pos; parse_fen(&pos, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    if (argc > 1 && !strcmp(argv[1], "bench")) { run_bench(); return; }
+    char line[4096];
     while (fgets(line, sizeof(line), stdin)) {
-        if (!strncmp(line, "ucinewgame", 10)) {
-            memset(tt, 0, (size_t)tt_size * sizeof(TTEntry)); memset(hist, 0, sizeof(hist));
-            parse_fen(STARTPOS); hash_key = generate_hash();
-        }
-        else if (!strncmp(line, "uci", 3)) {
-            puts("id name Chal " CHAL_VERSION "\nid author Naman Thanki\noption name Hash type spin default 16 min 1 max 4096\nuciok"); fflush(stdout);
-        }
-        else if (!strncmp(line, "setoption", 9)) {
-            /* setoption name Hash value <N>  (N in megabytes) */
-            char* nptr = strstr(line, "name Hash value ");
-            if (nptr) {
-                int mb = 1; sscanf(nptr + 16, "%d", &mb); if (mb < 1) mb = 1;
-                int64_t new_size = max((int64_t)1, ((int64_t)mb * 1024 * 1024) / (int64_t)sizeof(TTEntry));
-                TTEntry* new_tt = calloc((size_t)new_size, sizeof(TTEntry));
-                if (new_tt) { free(tt); tt = new_tt; tt_size = new_size; }
-            }
-        }
-        else if (!strncmp(line, "isready", 7)) { printf("readyok\n"); fflush(stdout); }
+        if (!strncmp(line, "uci", 3) && (line[3] == '\n' || line[3] == '\r' || line[3] == ' ' || line[3] == '\0')) {
+            printf("id name Chal " CHAL_VERSION "\nid author Naman Thanki\noption name Hash type spin default 16 min 1 max 1024\nuciok\n");
+            fflush(stdout);
+        } else if (!strncmp(line, "isready", 7)) { printf("readyok\n"); fflush(stdout); }
+        else if (!strncmp(line, "ucinewgame", 10)) { tt_clear(); memset(history, 0, sizeof(history)); pos_history_count = 0; parse_fen(&pos, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"); }
+        else if (!strncmp(line, "position", 8)) parse_position(&pos, line);
+        else if (!strncmp(line, "go", 2)) parse_go(&pos, line);
+        else if (!strncmp(line, "setoption name Hash value", 25)) { int mb = atoi(line + 25); if (mb >= 1 && mb <= 1024) tt_allocate(mb); }
+        else if (!strncmp(line, "eval", 4)) { printf("NNUE Eval: %+d cp\n", nnue_evaluate(&pos)); fflush(stdout); }
         else if (!strncmp(line, "perft", 5)) {
-            int depth = 4; sscanf(line, "perft %d", &depth);
-            printf("perft depth %d nodes %" PRId64 "\n", depth, perft(depth)); fflush(stdout);
-        }
-        else if (!strncmp(line, "position", 8)) {
-            if (strlen(line) <= 9) continue;
-            p = line + 9;
-            if (!strncmp(p, "startpos", 8)) {
-                parse_fen(STARTPOS);
-                p += 8;
-            }
-            else if (!strncmp(p, "fen", 3)) {
-                p += 4; parse_fen(p);
-            }
-            hash_key = generate_hash();
-            p = strstr(line, "moves");
-            if (p) {
-                p += 6;
-                while (*p) {
-                    char mv[6];
-                    int n = 0;
-                    while (*p == ' ') p++;
-                    if (*p == '\n' || !*p) break;
-                    sscanf(p, "%5s%n", mv, &n);
-                    if (n <= 0) break;
-                    if (parse_move(mv, &m)) make_move(m);
-                    p += n;
-                }
-            }
-        }
-        else if (!strncmp(line, "go", 2)) {
-            /* TIME CONTROL
-               ------------
-               UCI sends one of two forms:
-
-                 go depth N
-                   Fixed-depth mode: ignore the clock entirely, search
-                   exactly N plies.  Used by analysis GUIs and test suites.
-
-                 go wtime W btime B [movestogo M] [winc I] [binc I]
-                   Clock mode.  W and B are milliseconds remaining for
-                   White and Black.  movestogo is how many moves remain
-                   in the current time period (absent in increment-only
-                   time controls).  winc/binc are per-move increments.
-
-               BUDGET FORMULA
-               ---------------
-               Divide remaining time evenly across expected moves left:
-
-                   budget = our_time / movestogo + our_increment
-
-               If movestogo is not given we assume 20 moves remain --
-               a safe estimate for sudden-death and increment games.
-               search_root() iterates deeper until it has consumed more
-               than half the budget for a single depth (at which point
-               the next depth would almost certainly bust the limit), then
-               returns the best move from the last fully searched depth. */
-
-            int  depth = MAX_PLY;
-            int64_t wtime = 0, btime = 0, movestogo = 20, winc = 0, binc = 0;
-
-            getval(line, "depth", "%d", &depth);
-            getval(line, "wtime", "%" SCNd64, &wtime);
-            getval(line, "btime", "%" SCNd64, &btime);
-            getval(line, "movestogo", "%" SCNd64, &movestogo);
-            getval(line, "winc", "%" SCNd64, &winc);
-            getval(line, "binc", "%" SCNd64, &binc);
-
-            if (wtime || btime) {
-                int64_t our_time = (side == WHITE) ? wtime : btime;
-                int64_t our_inc = (side == WHITE) ? winc : binc;
-                if (movestogo <= 0) movestogo = 20;
-                time_budget_ms = (our_time / movestogo) + (our_inc * 3 / 4);
-                if (time_budget_ms > our_time - 50) time_budget_ms = our_time - 50;
-                if (time_budget_ms < 5) time_budget_ms = 5;
-                depth = MAX_PLY;
-            } else {
-                time_budget_ms = 0;
-            }
-            search_root(depth);
-        }
-        else if (!strncmp(line, "quit", 4)) break;
+            int d = atoi(line + 6); if (d < 1) d = 5;
+            clock_t start = clock(); u64 nodes = perft(&pos, d);
+            double el = (double)(clock() - start) / CLOCKS_PER_SEC;
+            printf("Perft(%d) = %llu nodes in %.3fs (%.2f MNPS)\n", d, (unsigned long long)nodes, el, (double)nodes / el / 1e6);
+            fflush(stdout);
+        } else if (!strncmp(line, "quit", 4)) break;
     }
-    free(tt);
 }
 
-/* ===============================================================
-   ENTRY POINT
-   =============================================================== */
-
-int main(void) {
-    setbuf(stdout, NULL);
-    memset(see_cleared, 0, sizeof(see_cleared));
-    init_zobrist();
-    init_lmr();
-    parse_fen(STARTPOS);
-    hash_key = generate_hash();
-    uci_loop();
+int main(int argc, char **argv) {
+    setvbuf(stdin, NULL, _IONBF, 0); setvbuf(stdout, NULL, _IONBF, 0);
+    init_attacks(); init_zobrist(); init_lmr();
+    nnue_init("src/net.nnue");
+    tt_allocate(16); memset(history, 0, sizeof(history));
+    uci_loop(argc, argv);
     return 0;
 }

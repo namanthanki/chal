@@ -784,7 +784,7 @@ static inline void print_score(int s) {
     else printf("score cp %d ", s);
 }
 
-static inline int history_bonus(int d) { int b = d * d; return b > MAX_BONUS ? MAX_BONUS : b; }
+static inline int history_bonus(int d) { return d * d; }
 static inline void update_history(int side, int from, int to, int src_th, int dst_th, int bonus) {
     int cl = bonus > MAX_BONUS ? MAX_BONUS : (bonus < -MAX_BONUS ? -MAX_BONUS : bonus);
     int cur = history[side][from][to][src_th][dst_th];
@@ -1110,7 +1110,7 @@ int search(Position *pos, int depth, int alpha, int beta, int ply, PVLine *pv, i
             if (time_over_flag) return 0;
             if (score > best_score) best_score = score;
             if (score >= beta) {
-                if (!is_tactical(pos, m)) {
+                if (!is_noisy) {
                     if (ply < MAX_PLY && m != killers[0][ply]) {
                         killers[1][ply] = killers[0][ply];
                         killers[0][ply] = m;

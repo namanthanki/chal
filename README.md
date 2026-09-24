@@ -129,7 +129,7 @@ go wtime 60000 btime 60000 movestogo 40
 
 **Commands:**
 - `perft <depth>`: Runs move-path verification. `perft 5` returns `4,865,609` nodes.
-- `bench`: Runs the 6-position perft verification suite and depth-4 search benchmark.
+- `bench [depth]`: Runs the benchmark suite and outputs in minimal OpenBench format (`<nodes> nodes <nps> nps`). Can be executed via UCI or directly from the terminal (`./chal.exe bench`). Default search depth is 4.
 - `eval`: Prints the static NNUE evaluation for the current position in centipawns.
 
 ## Acknowledgements

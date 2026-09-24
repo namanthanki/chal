@@ -703,7 +703,7 @@ enum { INF = 32000, MATE = 30000, MAX_PLY = 64 };
 static inline int is_tactical(const Position *pos, Move m) { return (pos->mailbox[move_to(m)] != NO_PIECE) || (move_flag(m) >= FLAG_EP); }
 
 u64 pos_history[1024];
-int pos_history_count = 0, time_over_flag = 0;
+int pos_history_count = 0, time_over_flag = 0, bench_silent = 0;
 clock_t search_start_time;
 int64_t search_hard_limit_ms = 0, search_soft_limit_ms = 0;
 u64 nodes_searched = 0;
@@ -1210,12 +1210,14 @@ int search_root(Position *pos, int max_depth, int64_t hard_limit_ms, int64_t sof
         int64_t ms = (int64_t)(elapsed * 1000 / CLOCKS_PER_SEC);
         u64 nps = ms > 0 ? (nodes_searched * 1000 / ms) : 0;
 
-        printf("info depth %d ", depth);
-        print_score(score);
-        printf("nodes %llu time %lld nps %llu pv ", (unsigned long long)nodes_searched, (long long)ms, (unsigned long long)nps);
-        for (int i = 0; i < root_pv.count; i++) { print_move(root_pv.moves[i]); printf(" "); }
-        printf("\n");
-        fflush(stdout);
+        if (!bench_silent) {
+            printf("info depth %d ", depth);
+            print_score(score);
+            printf("nodes %llu time %lld nps %llu pv ", (unsigned long long)nodes_searched, (long long)ms, (unsigned long long)nps);
+            for (int i = 0; i < root_pv.count; i++) { print_move(root_pv.moves[i]); printf(" "); }
+            printf("\n");
+            fflush(stdout);
+        }
 
         if (score > MATE - 512 || score < -MATE + 512) break;
 
@@ -1230,10 +1232,12 @@ int search_root(Position *pos, int max_depth, int64_t hard_limit_ms, int64_t sof
         }
     }
 
-    printf("bestmove ");
-    if (root_pv.count > 0) print_move(root_pv.moves[0]);
-    printf("\n");
-    fflush(stdout);
+    if (!bench_silent) {
+        printf("bestmove ");
+        if (root_pv.count > 0) print_move(root_pv.moves[0]);
+        printf("\n");
+        fflush(stdout);
+    }
     return score;
 }
 
@@ -1364,7 +1368,7 @@ u64 perft(Position *pos, int depth) {
     return nodes;
 }
 
-void run_bench(void) {
+void run_bench(int depth) {
     static const struct { const char *f; int d; u64 n; } p[6] = {
         {"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 5, 4865609},
         {"r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 4, 4085603},
@@ -1375,22 +1379,23 @@ void run_bench(void) {
     };
     const char *s[6] = { p[0].f, "r1bqkb1r/pppp1ppp/2n5/4p3/2B1n3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 5", "r2q1rk1/ppp2ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPP2PPP/R2Q1RK1 w - - 0 8", "r1b1k2r/ppppqppp/2n5/8/1bPP4/2N5/PP2BPPP/R1BQK2R w KQkq - 0 9", p[2].f, p[1].f };
     Position pos; u64 tot = 0; clock_t st = clock();
-    printf("Running Perft Test Suite...\n");
     for (int i = 0; i < 6; i++) {
-        parse_fen(&pos, p[i].f); u64 n = perft(&pos, p[i].d); tot += n;
-        printf("Pos %d (depth %d): %llu nodes %s\n", i + 1, p[i].d, (unsigned long long)n, n == p[i].n ? "[PASS]" : "[FAIL]");
+        parse_fen(&pos, p[i].f); tot += perft(&pos, p[i].d);
     }
-    double el = (double)(clock() - st) / CLOCKS_PER_SEC;
-    printf("Total Nodes: %llu, Time: %.3fs, NPS: %.2f MNPS\n\nSearch Benchmark (Pure Negamax Depth 4):\n", (unsigned long long)tot, el, tot / el / 1e6);
+    bench_silent = 1;
     for (int i = 0; i < 6; i++) {
         parse_fen(&pos, s[i]); tt_clear();
-        printf("Position %d:\n", i + 1); search_root(&pos, 4, 0, 0); printf("\n");
+        search_root(&pos, depth, 0, 0); tot += nodes_searched;
     }
+    bench_silent = 0;
+    double el = (double)(clock() - st) / CLOCKS_PER_SEC;
+    u64 nps = el > 0.0001 ? (u64)((double)tot / el) : 0;
+    printf("%llu nodes %llu nps\n", (unsigned long long)tot, (unsigned long long)nps);
 }
 
 void uci_loop(int argc, char **argv) {
     Position pos; parse_fen(&pos, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-    if (argc > 1 && !strcmp(argv[1], "bench")) { run_bench(); return; }
+    if (argc > 1 && !strcmp(argv[1], "bench")) { int depth = (argc > 2) ? atoi(argv[2]) : 4; if (depth <= 0) depth = 4; run_bench(depth); return; }
     char line[4096];
     while (fgets(line, sizeof(line), stdin)) {
         if (!strncmp(line, "uci", 3) && (line[3] == '\n' || line[3] == '\r' || line[3] == ' ' || line[3] == '\0')) {
@@ -1402,6 +1407,7 @@ void uci_loop(int argc, char **argv) {
         else if (!strncmp(line, "go", 2)) parse_go(&pos, line);
         else if (!strncmp(line, "setoption name Hash value", 25)) { int mb = atoi(line + 25); if (mb >= 1 && mb <= 1024) tt_allocate(mb); }
         else if (!strncmp(line, "eval", 4)) { printf("NNUE Eval: %+d cp\n", nnue_evaluate(&pos)); fflush(stdout); }
+        else if (!strncmp(line, "bench", 5)) { int d = atoi(line + 5); if (d <= 0) d = 4; run_bench(d); }
         else if (!strncmp(line, "perft", 5)) {
             int d = atoi(line + 6); if (d < 1) d = 5;
             clock_t start = clock(); u64 nodes = perft(&pos, d);

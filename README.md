@@ -25,7 +25,7 @@ With version 2.0, the engine was rewritten from scratch, replacing the original 
 | Chal 1.3.2 | 2505       | 2466       | —           | —          | 0x88 + HCE   |
 | Chal 1.4.0 | 2713       | —          | —           | —          | 0x88 + HCE   |
 | Chal 1.4.1 | 2756       | 2764       | —           | —          | 0x88 + HCE   |
-| Chal 2.0.0 | 3107       | 3137       | 3044        | —          | Bitboards + NNUE |
+| Chal 2.0.0 | 3107       | 3137       | 3044        | 3199       | Bitboards + NNUE |
 
 ## What "complete" means here
 

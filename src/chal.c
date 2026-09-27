@@ -312,22 +312,28 @@ static inline void tt_store(u64 hash, int depth, int score, int bound, Move m, i
    256-bit AVX2 registers (via GCC's v16 vector type).
 
    Each side maintains its own perspective; Black's view flips the
-   board vertically (sq ^ 56). The hidden values pass through a
-   squared clipped linear unit (SCReLU: clamp to [0, 255], square),
-   and the output layer computes an inner product scaled to centipawns.
+   board vertically (sq ^ 56). Both sides apply horizontal mirroring
+   (HM) when their king is on the kingside (file > 3, sq ^ 7), refreshing
+   that perspective whenever its king crosses the board's midline.
+
+   The hidden values pass through a squared clipped linear unit
+   (SCReLU: clamp to [0, 255], square). The output layer computes an
+   inner product with weights and bias chosen from 8 material-count
+   output buckets (8OB), scaled to centipawns.
 */
 
 typedef int16_t i16; typedef int32_t i32; typedef i16 v16 __attribute__((vector_size(32)));
 
 enum {
-    NNUE_INPUT_SIZE  = 768, NNUE_HIDDEN_SIZE = 32,
-    NNUE_VECTORS     = NNUE_HIDDEN_SIZE / 16,
-    NNUE_EVAL_SCALE  = 400, NNUE_L0_SCALE = 255, NNUE_L1_SCALE = 64
+    NNUE_INPUT_SIZE     = 768, NNUE_HIDDEN_SIZE = 32,
+    NNUE_VECTORS        = NNUE_HIDDEN_SIZE / 16,
+    NNUE_OUTPUT_BUCKETS = 8,
+    NNUE_EVAL_SCALE     = 400, NNUE_L0_SCALE = 255, NNUE_L1_SCALE = 64
 };
 
 typedef struct {
     i16 input_weights[NNUE_INPUT_SIZE][NNUE_HIDDEN_SIZE], input_biases[NNUE_HIDDEN_SIZE];
-    i16 output_weights[2][NNUE_HIDDEN_SIZE], output_bias;
+    i16 output_weights[NNUE_OUTPUT_BUCKETS][2][NNUE_HIDDEN_SIZE], output_biases[NNUE_OUTPUT_BUCKETS];
 } NNUEParameters;
 
 typedef union __attribute__((aligned(64))) {
@@ -340,82 +346,63 @@ static __attribute__((aligned(64))) NNUEParameters nnue_params; static NNUEState
 
 #include "net.h"
 
-static inline i32 nnue_screlu(i32 x) { i32 c = (x < 0) ? 0 : ((x > NNUE_L0_SCALE) ? NNUE_L0_SCALE : x); return c * c; }
+static inline int king_hflip(const Position *pos, int side) { return (lsb(pos->pieces[side][KING]) % 8 > 3) ? 7 : 0; }
 
-static inline void nnue_feat(int c, int pt, int sq, const v16 **pw, const v16 **pb) {
-    *pw = (const v16 *)nnue_params.input_weights[c * 384 + pt * 64 + sq];
-    *pb = (const v16 *)nnue_params.input_weights[(c ^ 1) * 384 + pt * 64 + (sq ^ 56)];
+static inline void nnue_feat_hm(int c, int pt, int sq, int wf, int bf, const v16 **pw, const v16 **pb) {
+    *pw = (const v16 *)nnue_params.input_weights[c * 384 + pt * 64 + (sq ^ wf)];
+    *pb = (const v16 *)nnue_params.input_weights[(c ^ 1) * 384 + pt * 64 + (sq ^ 56 ^ bf)];
 }
 
-static inline void nnue_add1sub1(Accumulator *dst, const Accumulator *src, int ac, int apt, int asq, int sc, int spt, int ssq) {
-    const v16 *aw, *ab, *sw, *sb;
-    nnue_feat(ac, apt, asq, &aw, &ab); nnue_feat(sc, spt, ssq, &sw, &sb);
-    for (int i = 0; i < NNUE_VECTORS; i++) {
-        dst->vec[0][i] = src->vec[0][i] + aw[i] - sw[i];
-        dst->vec[1][i] = src->vec[1][i] + ab[i] - sb[i];
-    }
+static inline void nnue_add1sub1(Accumulator *dst, const Accumulator *src, int wf, int bf, int ac, int apt, int asq, int sc, int spt, int ssq) {
+    const v16 *aw, *ab, *sw, *sb; nnue_feat_hm(ac, apt, asq, wf, bf, &aw, &ab); nnue_feat_hm(sc, spt, ssq, wf, bf, &sw, &sb);
+    for (int i = 0; i < NNUE_VECTORS; i++) { dst->vec[0][i] = src->vec[0][i] + aw[i] - sw[i]; dst->vec[1][i] = src->vec[1][i] + ab[i] - sb[i]; }
 }
 
-static inline void nnue_add1sub2(Accumulator *dst, const Accumulator *src, int ac, int apt, int asq, int s1c, int s1pt, int s1sq, int s2c, int s2pt, int s2sq) {
+static inline void nnue_add1sub2(Accumulator *dst, const Accumulator *src, int wf, int bf, int ac, int apt, int asq, int s1c, int s1pt, int s1sq, int s2c, int s2pt, int s2sq) {
     const v16 *aw, *ab, *s1w, *s1b, *s2w, *s2b;
-    nnue_feat(ac, apt, asq, &aw, &ab); nnue_feat(s1c, s1pt, s1sq, &s1w, &s1b); nnue_feat(s2c, s2pt, s2sq, &s2w, &s2b);
-    for (int i = 0; i < NNUE_VECTORS; i++) {
-        dst->vec[0][i] = src->vec[0][i] + aw[i] - s1w[i] - s2w[i];
-        dst->vec[1][i] = src->vec[1][i] + ab[i] - s1b[i] - s2b[i];
-    }
+    nnue_feat_hm(ac, apt, asq, wf, bf, &aw, &ab); nnue_feat_hm(s1c, s1pt, s1sq, wf, bf, &s1w, &s1b); nnue_feat_hm(s2c, s2pt, s2sq, wf, bf, &s2w, &s2b);
+    for (int i = 0; i < NNUE_VECTORS; i++) { dst->vec[0][i] = src->vec[0][i] + aw[i] - s1w[i] - s2w[i]; dst->vec[1][i] = src->vec[1][i] + ab[i] - s1b[i] - s2b[i]; }
 }
 
-static inline void nnue_add2sub2(Accumulator *dst, const Accumulator *src, int a1c, int a1pt, int a1sq, int a2c, int a2pt, int a2sq, int s1c, int s1pt, int s1sq, int s2c, int s2pt, int s2sq) {
+static inline void nnue_add2sub2(Accumulator *dst, const Accumulator *src, int wf, int bf, int a1c, int a1pt, int a1sq, int a2c, int a2pt, int a2sq, int s1c, int s1pt, int s1sq, int s2c, int s2pt, int s2sq) {
     const v16 *a1w, *a1b, *a2w, *a2b, *s1w, *s1b, *s2w, *s2b;
-    nnue_feat(a1c, a1pt, a1sq, &a1w, &a1b); nnue_feat(a2c, a2pt, a2sq, &a2w, &a2b);
-    nnue_feat(s1c, s1pt, s1sq, &s1w, &s1b); nnue_feat(s2c, s2pt, s2sq, &s2w, &s2b);
-    for (int i = 0; i < NNUE_VECTORS; i++) {
-        dst->vec[0][i] = src->vec[0][i] + a1w[i] + a2w[i] - s1w[i] - s2w[i];
-        dst->vec[1][i] = src->vec[1][i] + a1b[i] + a2b[i] - s1b[i] - s2b[i];
-    }
+    nnue_feat_hm(a1c, a1pt, a1sq, wf, bf, &a1w, &a1b); nnue_feat_hm(a2c, a2pt, a2sq, wf, bf, &a2w, &a2b);
+    nnue_feat_hm(s1c, s1pt, s1sq, wf, bf, &s1w, &s1b); nnue_feat_hm(s2c, s2pt, s2sq, wf, bf, &s2w, &s2b);
+    for (int i = 0; i < NNUE_VECTORS; i++) { dst->vec[0][i] = src->vec[0][i] + a1w[i] + a2w[i] - s1w[i] - s2w[i]; dst->vec[1][i] = src->vec[1][i] + a1b[i] + a2b[i] - s1b[i] - s2b[i]; }
 }
 
-void nnue_refresh(const Position *pos) {
-    acc_ply = 0;
+static void nnue_refresh_persp(const Position *pos, int persp, Accumulator *acc) {
+    int flip = king_hflip(pos, persp);
     const v16 *bias = (const v16 *)nnue_params.input_biases;
-    for (int i = 0; i < NNUE_VECTORS; i++) nnue.stack[0].vec[0][i] = nnue.stack[0].vec[1][i] = bias[i];
+    for (int i = 0; i < NNUE_VECTORS; i++) acc->vec[persp][i] = bias[i];
     for (int c = 0; c < 2; c++)
         for (int pt = 0; pt < 6; pt++)
             for (u64 bb = pos->pieces[c][pt]; bb; ) {
-                const v16 *w, *b;
-                nnue_feat(c, pt, pop_lsb(&bb), &w, &b);
-                for (int i = 0; i < NNUE_VECTORS; i++) {
-                    nnue.stack[0].vec[0][i] += w[i];
-                    nnue.stack[0].vec[1][i] += b[i];
-                }
+                int sq = pop_lsb(&bb), feat = (persp == WHITE) ? (c * 384 + pt * 64 + (sq ^ flip)) : ((c ^ 1) * 384 + pt * 64 + (sq ^ 56 ^ flip));
+                const v16 *w = (const v16 *)nnue_params.input_weights[feat];
+                for (int i = 0; i < NNUE_VECTORS; i++) acc->vec[persp][i] += w[i];
             }
 }
 
+void nnue_refresh(const Position *pos) { acc_ply = 0; nnue_refresh_persp(pos, WHITE, &nnue.stack[0]); nnue_refresh_persp(pos, BLACK, &nnue.stack[0]); }
+
+static inline i32 nnue_screlu(i32 x) { i32 c = (x < 0) ? 0 : ((x > NNUE_L0_SCALE) ? NNUE_L0_SCALE : x); return c * c; }
+
 int nnue_evaluate(const Position *pos) {
-    int stm = pos->side;
+    int stm = pos->side, b = (popcount(pos->occ[BOTH]) - 2) / 4;
+    if (b > 7) b = 7; else if (b < 0) b = 0;
     const Accumulator *acc = &nnue.stack[acc_ply];
     const i16 *acc0 = acc->accumulation[stm], *acc1 = acc->accumulation[stm ^ 1];
-    const i16 *w0 = nnue_params.output_weights[0], *w1 = nnue_params.output_weights[1];
+    const i16 *w0 = nnue_params.output_weights[b][0], *w1 = nnue_params.output_weights[b][1];
     i32 score = 0;
-    for (int i = 0; i < NNUE_HIDDEN_SIZE; i++)
-        score += nnue_screlu(acc0[i]) * (i32)w0[i] + nnue_screlu(acc1[i]) * (i32)w1[i];
-    return (int)(((score / NNUE_L0_SCALE) + nnue_params.output_bias) * NNUE_EVAL_SCALE / (NNUE_L0_SCALE * NNUE_L1_SCALE));
+    for (int i = 0; i < NNUE_HIDDEN_SIZE; i++) score += nnue_screlu(acc0[i]) * (i32)w0[i] + nnue_screlu(acc1[i]) * (i32)w1[i];
+    return (int)(((score / NNUE_L0_SCALE) + nnue_params.output_biases[b]) * NNUE_EVAL_SCALE / (NNUE_L0_SCALE * NNUE_L1_SCALE));
 }
 
 int nnue_init(const char *path) {
     size_t need = sizeof(nnue_params);
-    if ((size_t)nnue_embedded_size >= need) {
-        memcpy(&nnue_params, nnue_embedded, need);
-        return (nnue.loaded = 1);
-    }
-    if (path) {
-        FILE *f = fopen(path, "rb");
-        if (f) {
-            size_t got = fread(&nnue_params, 1, need, f);
-            fclose(f);
-            return (nnue.loaded = (got == need));
-        }
-    }
+    if ((size_t)nnue_embedded_size >= need) { memcpy(&nnue_params, nnue_embedded, need); return (nnue.loaded = 1); }
+    if (path) { FILE *f = fopen(path, "rb"); if (f) { size_t got = fread(&nnue_params, 1, need, f); fclose(f); return (nnue.loaded = (got == need)); } }
     return 0;
 }
 
@@ -487,31 +474,36 @@ void make_move(Position *pos, Move m, UndoInfo *undo) {
     pos->halfmove = (pt == PAWN || cap != NO_PIECE) ? 0 : pos->halfmove + 1;
 
     Accumulator *src = &nnue.stack[acc_ply], *dst = &nnue.stack[acc_ply + 1];
+    int w_flip = king_hflip(pos, WHITE), b_flip = king_hflip(pos, BLACK);
+    int us_crossed = (pt == KING) && ((from % 8 > 3) != (to % 8 > 3));
+    int rf = 0, rt = 0, ep_cap_sq = 0, final_pt = pt;
 
     if (flag == FLAG_CASTLE) {
         clear_piece(pos, us, KING, from); set_piece(pos, us, KING, to);
         pos->hash ^= zobrist_piece[us][KING][from] ^ zobrist_piece[us][KING][to];
-        int rf = (to == G1) ? H1 : (to == C1) ? A1 : (to == G8) ? H8 : A8;
-        int rt = (to == G1) ? F1 : (to == C1) ? D1 : (to == G8) ? F8 : D8;
+        rf = (to == G1) ? H1 : (to == C1) ? A1 : (to == G8) ? H8 : A8;
+        rt = (to == G1) ? F1 : (to == C1) ? D1 : (to == G8) ? F8 : D8;
         clear_piece(pos, us, ROOK, rf); set_piece(pos, us, ROOK, rt);
         pos->hash ^= zobrist_piece[us][ROOK][rf] ^ zobrist_piece[us][ROOK][rt];
-        if (nnue.loaded) nnue_add2sub2(dst, src, us, KING, to, us, ROOK, rt, us, KING, from, us, ROOK, rf);
     } else if (flag == FLAG_EP) {
         clear_piece(pos, us, PAWN, from); set_piece(pos, us, PAWN, to);
-        int ep_cap_sq = (us == WHITE) ? to - 8 : to + 8;
+        ep_cap_sq = (us == WHITE) ? to - 8 : to + 8;
         clear_piece(pos, them, PAWN, ep_cap_sq);
         pos->hash ^= zobrist_piece[us][PAWN][from] ^ zobrist_piece[us][PAWN][to] ^ zobrist_piece[them][PAWN][ep_cap_sq];
-        if (nnue.loaded) nnue_add1sub2(dst, src, us, PAWN, to, us, PAWN, from, them, PAWN, ep_cap_sq);
     } else {
         if (cap != NO_PIECE) { clear_piece(pos, them, cap, to); pos->hash ^= zobrist_piece[them][cap][to]; }
         clear_piece(pos, us, pt, from); pos->hash ^= zobrist_piece[us][pt][from];
-        int final_pt = (flag >= FLAG_PROMO_N) ? promo_piece(flag) : pt;
+        final_pt = (flag >= FLAG_PROMO_N) ? promo_piece(flag) : pt;
         set_piece(pos, us, final_pt, to); pos->hash ^= zobrist_piece[us][final_pt][to];
         if (flag == FLAG_DOUBLE_PUSH) { pos->ep = (us == WHITE) ? from + 8 : from - 8; pos->hash ^= zobrist_ep[pos->ep]; }
-        if (nnue.loaded) {
-            if (cap != NO_PIECE) nnue_add1sub2(dst, src, us, final_pt, to, us, pt, from, them, cap, to);
-            else nnue_add1sub1(dst, src, us, final_pt, to, us, pt, from);
-        }
+    }
+
+    if (nnue.loaded) {
+        if (flag == FLAG_CASTLE) nnue_add2sub2(dst, src, w_flip, b_flip, us, KING, to, us, ROOK, rt, us, KING, from, us, ROOK, rf);
+        else if (flag == FLAG_EP) nnue_add1sub2(dst, src, w_flip, b_flip, us, PAWN, to, us, PAWN, from, them, PAWN, ep_cap_sq);
+        else if (cap != NO_PIECE) nnue_add1sub2(dst, src, w_flip, b_flip, us, final_pt, to, us, pt, from, them, cap, to);
+        else nnue_add1sub1(dst, src, w_flip, b_flip, us, final_pt, to, us, pt, from);
+        if (us_crossed) nnue_refresh_persp(pos, us, dst);
     }
 
     acc_ply++;
